@@ -132,7 +132,13 @@ def run_day(config,day,*,allow_online=False,clock=None,state=None,budget=None,tr
     base_config=ResolvedConfig(config.study.model_copy(update={'dates':[]}),config.policy,config.sources,config.budget)
     plan_config=next((c for c in (configured,config,base_config) if plan_matches_config(plan,c)),configured)
     state=state or State(config.output('state/capture.sqlite'))
-    with portalocker.Lock(config.output('state/capture.lock'),timeout=0):
+    lock_path = (
+        state.path.with_name('capture.lock')
+        if hasattr(state, 'path') and state.path
+        else Path(config.output('state/capture.lock'))
+    )
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with portalocker.Lock(lock_path,timeout=0):
         read_current(config)
         check=preflight(plan,plan_config,allow_online,state=state,day=day,clock=clock)
         progress('Preflight',**check)
@@ -172,7 +178,13 @@ def transform_day(config,day,*,queue_factory=ETLQueue,progress=None):
     day=date.fromisoformat(str(day));config=_day_config(config,day)
     progress=progress or Progress(config.output(f'logs/{day}.log'),timezone=config.study.timezone)
     paths=_paths(config);state=State(config.output('state/capture.sqlite'))
-    with portalocker.Lock(config.output('state/capture.lock'),timeout=0):
+    lock_path = (
+        state.path.with_name('capture.lock')
+        if hasattr(state, 'path') and state.path
+        else Path(config.output('state/capture.lock'))
+    )
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with portalocker.Lock(lock_path,timeout=0):
         read_current(config)
         records={}
         for manifest in config.output(f'raw/{config.study.study_id}/{day}').glob('*/manifest.json'):
