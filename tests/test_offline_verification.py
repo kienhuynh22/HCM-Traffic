@@ -609,6 +609,117 @@ class TestOfflinePipelineVerification(unittest.TestCase):
         self.assertIn("failed", err_msg)
         self.assertIn("Refusing fallback to older runs", err_msg)
 
+    # --------------------------------------------------------------------------
+    # 11. Early Cancelled / Failed Runs Sequence Allows Clean Bootstrap
+    # --------------------------------------------------------------------------
+    def test_11_early_stopped_runs_sequence_allows_bootstrap_or_prior_checkpoint(self):
+        from scripts.manage_state import verify_run_stopped_before_ledger, inspect_and_select_latest_checkpoint
+
+        # 1. Mock Run #1: Cancelled while queued (runner_id: 0, steps: [])
+        job_run_1 = [{"runner_id": 0, "runner_name": "", "steps": []}]
+        stopped_1, reason_1 = verify_run_stopped_before_ledger(job_run_1)
+        self.assertTrue(stopped_1)
+        self.assertIn("stopped before step", reason_1)
+
+        # 2. Mock Run #2: Failed at Step 10, Step 11 skipped
+        job_run_2 = [{
+            "runner_id": 12345,
+            "runner_name": "GitHub Actions 2",
+            "steps": [
+                {"name": "Retrieve Latest State Checkpoint Artifact (Fallback or Supersede)", "status": "completed", "conclusion": "failure"},
+                {"name": "Verify and Reconcile State Ledger", "status": "completed", "conclusion": "skipped"},
+                {"name": "Execute Capture Run (Trial or Afternoon)", "status": "completed", "conclusion": "skipped"},
+            ]
+        }]
+        stopped_2, reason_2 = verify_run_stopped_before_ledger(job_run_2)
+        self.assertTrue(stopped_2)
+        self.assertIn("stopped before step", reason_2)
+
+        # 3. Simulate history where both Run #1 and Run #2 stopped before ledger
+        # Case 3a: No earlier checkpoint exists and allow_init=True -> Clean bootstrap succeeds
+        fresh_state = self.temp_dir / "bootstrap_after_skipped/capture.sqlite"
+        saved_argv = sys.argv
+        try:
+            sys.argv = [
+                "manage_state.py",
+                "verify-restore",
+                "--state-file", str(fresh_state),
+                "--allow-init",
+                "--study-id", "hcm_urban_13paths",
+                "--registry-version", "main13_20261117_869a0f5a",
+            ]
+            from scripts.manage_state import main as manage_state_main
+            ec = manage_state_main()
+            self.assertEqual(ec, 0)
+            self.assertTrue(fresh_state.is_file())
+        finally:
+            sys.argv = saved_argv
+
+        # Case 3b: Run #0 exists BEFORE Run #1 and has a valid checkpoint (44/52).
+        # Since Run #2 and Run #1 stopped before ledger, inspect_and_select_latest_checkpoint
+        # must safely skip them and restore Run #0!
+        run_0_dir = self.temp_dir / "run_0_valid"
+        run_0_db = run_0_dir / "capture.sqlite"
+        run_0_dir.mkdir(parents=True, exist_ok=True)
+        State(run_0_db)
+        import_external_usage(run_0_db, "session_0", date(2026, 11, 18), 44, 52, allow_init=False)
+        chk_0 = create_checkpoint(
+            run_0_db,
+            run_0_dir / "checkpoints",
+            metadata={
+                "study_id": "hcm_urban_13paths",
+                "registry_version": "main13_20261117_869a0f5a",
+                "run_id": "1000",
+                "created_at_utc": "2026-11-18T09:00:00+00:00",
+            },
+        )
+
+        candidates_with_skipped = [
+            {"run_id": "1002", "created_at": "2026-11-18T11:00:00+00:00", "archive_path": Path("dummy2"), "stopped_before_ledger": True},
+            {"run_id": "1001", "created_at": "2026-11-18T10:00:00+00:00", "archive_path": Path("dummy1"), "stopped_before_ledger": True},
+            {"run_id": "1000", "created_at": "2026-11-18T09:00:00+00:00", "archive_path": chk_0, "stopped_before_ledger": False},
+        ]
+        best_p, best_m = inspect_and_select_latest_checkpoint(candidates_with_skipped, {"study_id": "hcm_urban_13paths", "registry_version": "main13_20261117_869a0f5a"})
+        self.assertEqual(best_m.get("run_id"), "1000")
+        self.assertEqual(best_m.get("cumulative_counts"), {"traffic": 44, "weather": 52})
+
+    # --------------------------------------------------------------------------
+    # 12. Run Reached Ledger Step Without Checkpoint Must NOT Be Skipped
+    # --------------------------------------------------------------------------
+    def test_12_run_reached_ledger_without_checkpoint_halts(self):
+        from scripts.manage_state import verify_run_stopped_before_ledger
+
+        # 1. Job that reached 'Verify and Reconcile State Ledger' with conclusion 'success'
+        job_success = [{
+            "runner_id": 999,
+            "runner_name": "GitHub Actions",
+            "steps": [
+                {"name": "Verify and Reconcile State Ledger", "status": "completed", "conclusion": "success"},
+                {"name": "Execute Capture Run (Trial or Afternoon)", "status": "completed", "conclusion": "failure"},
+            ]
+        }]
+        stopped, reason = verify_run_stopped_before_ledger(job_success)
+        self.assertFalse(stopped)
+        self.assertIn("was reached", reason)
+
+        # 2. Job that was cancelled while 'Verify and Reconcile State Ledger' was in progress
+        job_cancelled_in_ledger = [{
+            "runner_id": 999,
+            "runner_name": "GitHub Actions",
+            "steps": [
+                {"name": "Verify and Reconcile State Ledger", "status": "completed", "conclusion": "cancelled"},
+            ]
+        }]
+        stopped_c, reason_c = verify_run_stopped_before_ledger(job_cancelled_in_ledger)
+        self.assertFalse(stopped_c)
+        self.assertIn("was reached", reason_c)
+
+        # 3. Runner was assigned but step list is empty (ambiguous / incomplete log)
+        job_ambiguous = [{"runner_id": 999, "runner_name": "GitHub Actions", "steps": []}]
+        stopped_a, reason_a = verify_run_stopped_before_ledger(job_ambiguous)
+        self.assertFalse(stopped_a)
+        self.assertIn("step list is empty", reason_a)
+
 
 if __name__ == "__main__":
     unittest.main()
