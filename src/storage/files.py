@@ -45,7 +45,21 @@ def atomic_bytes(path: Path, body: bytes, *, immutable: bool = False) -> str:
             os.fsync(stream.fileno())
         if immutable:
             # Hardlink creates the final name exclusively, including across processes.
-            os.link(temporary, path)
+            # On Windows (nt), CreateHardLinkW may raise PermissionError (WinError 5).
+            # When PermissionError occurs on Windows, if the destination already exists,
+            # FileExistsError is propagated; otherwise os.rename provides atomic creation.
+            # Non-Windows platforms preserve the strict os.link behavior without fallback.
+            if os.name == "nt":
+                try:
+                    os.link(temporary, path)
+                except FileExistsError:
+                    raise
+                except PermissionError:
+                    if path.exists():
+                        raise FileExistsError(path)
+                    os.rename(temporary, path)
+            else:
+                os.link(temporary, path)
         else:
             os.replace(temporary, path)
     finally:

@@ -1,6 +1,7 @@
 """Explicit online day workflow and single-process offline ETL queue."""
 from concurrent.futures import ProcessPoolExecutor
 from datetime import date,datetime,timezone
+from zoneinfo import ZoneInfo
 from pathlib import Path
 import threading
 import uuid
@@ -92,7 +93,11 @@ class ETLQueue:
                 self.state.set_job(*args,'published',result_path=result['run'])
                 self.results.append(published)
                 self.progress('Interim tables updated',rows=published['rows'],day_rows=published['partition_rows'])
-                self.progress('Today',**day_counts(self.config,record['scheduled_at'][:10]))
+                scheduled_dt = datetime.fromisoformat(record['scheduled_at'])
+                if scheduled_dt.tzinfo is None:
+                    scheduled_dt = scheduled_dt.replace(tzinfo=timezone.utc)
+                accounting_day = scheduled_dt.astimezone(ZoneInfo(self.config.study.timezone)).date()
+                self.progress('Today',**day_counts(self.config,accounting_day))
             except Exception as exc:
                 status='publish_failed' if result else 'processing_failed'
                 self.state.set_job(*args,status,result_path=result.get('run') if result else None,error=type(exc).__name__)

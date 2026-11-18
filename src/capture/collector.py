@@ -2,6 +2,7 @@
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone, timedelta
+from zoneinfo import ZoneInfo
 from email.utils import parsedate_to_datetime
 import threading
 import uuid
@@ -39,11 +40,17 @@ def capture_snapshot(
         snapshot_id
         or datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ") + "_" + uuid.uuid4().hex[:8]
     )
+    study_zone = ZoneInfo(config.study.timezone)
+    raw_day = (
+        scheduled_at.astimezone(study_zone).date()
+        if scheduled_at
+        else clock.now_utc().astimezone(study_zone).date()
+    ).isoformat()
     folder = config.output(
         "raw/"
         + config.study.study_id
         + "/"
-        + clock.now_utc().date().isoformat()
+        + raw_day
         + "/"
         + snapshot_id
     )
