@@ -1,0 +1,554 @@
+name: Capture 13 Paths
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: 'Execution mode: trial_3slots (test 3 future slots) or afternoon_37slots (production 16:00-19:00 VN)'
+        required: true
+        type: choice
+        options:
+          - trial_3slots
+          - afternoon_37slots
+        default: trial_3slots
+      dry_run:
+        description: 'Run preflight check only (do not call live APIs)'
+        required: false
+        type: boolean
+        default: true
+      allow_init_state:
+        description: 'Allow initializing fresh state ledger if not found (strictly false by default to prevent budget reset)'
+        required: false
+        type: boolean
+        default: false
+      date:
+        description: 'Capture date (YYYY-MM-DD in Asia/Ho_Chi_Minh). If empty, auto-detects current date in Vietnam time'
+        required: false
+        type: string
+        default: ''
+      import_external_source:
+        description: 'Optional external session ID to import (e.g. local_pilot_20261118_v1)'
+        required: false
+        type: string
+        default: ''
+      import_date:
+        description: 'Accounting date for external usage import (YYYY-MM-DD). If empty and import_external_source is set, defaults to 2026-11-18'
+        required: false
+        type: string
+        default: '2026-11-18'
+      import_traffic:
+        description: 'Number of external traffic attempts to reconcile'
+        required: false
+        type: number
+        default: 0
+      import_weather:
+        description: 'Number of external weather attempts to reconcile'
+        required: false
+        type: number
+        default: 0
+
+  # Scheduled runs for afternoon window: 16:00 - 19:00 VN (37 slots, 5-minute intervals).
+  # 16:00 Asia/Ho_Chi_Minh = 09:00 UTC.
+  # Starting at 08:50 UTC (15:50 VN) provides a 10-minute margin for runner spinup,
+  # dependency loading, integrity verification, and precise Python scheduler sync.
+  #
+  # NOTE: Kept commented out / disabled until manual workflow_dispatch test run succeeds.
+  # schedule:
+  #   - cron: '50 8 * * *'
+
+concurrency:
+  group: capture-13paths
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  capture:
+    name: Execute 13-Path Capture
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+
+    env:
+      STUDY_CONFIG: config/ci/study_13paths.yaml
+      TZ: Asia/Ho_Chi_Minh
+      TOMTOM_API_KEY: ${{ secrets.TOMTOM_API_KEY }}
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          # Filter Windows-only pywin32 before installing requirements on Linux
+          grep -v "pywin32" requirements.txt > /tmp/requirements_linux.txt
+          pip install -r /tmp/requirements_linux.txt
+          pip install --no-deps -e .
+
+      - name: Restore Reference Inputs Cache (Speedup)
+        uses: actions/cache/restore@v4
+        id: reference-cache
+        with:
+          path: data/reference
+          key: hcm-traffic-ref-main13-v1-930bc793558b82e6037208ce12260c5bd3114cd2a235dc4aeecfef6cea0e5006
+
+      - name: Fetch and Verify Reference Inputs
+        run: |
+          python scripts/fetch_inputs.py \
+            --target-dir data/reference \
+            --expected-sha256 930bc793558b82e6037208ce12260c5bd3114cd2a235dc4aeecfef6cea0e5006
+
+      - name: Save Reference Inputs Cache
+        if: steps.reference-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: data/reference
+          key: hcm-traffic-ref-main13-v1-930bc793558b82e6037208ce12260c5bd3114cd2a235dc4aeecfef6cea0e5006
+
+      - name: Determine Run Scope and State Path
+        id: run-scope
+        env:
+          INPUT_DATE: ${{ inputs.date }}
+          INPUT_MODE: ${{ inputs.mode }}
+          INPUT_DRY_RUN: ${{ inputs.dry_run }}
+          INPUT_ALLOW_INIT: ${{ inputs.allow_init_state }}
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          # Resolve canonical state path directly from the configuration
+          STATE_PATH=$(python -c "from pathlib import Path; from src.config import load_config; print(load_config(Path('$STUDY_CONFIG')).output('state/capture.sqlite'))")
+          echo "state_file=$STATE_PATH" >> $GITHUB_OUTPUT
+          echo "Resolved Canonical State File: $STATE_PATH"
+
+          # Validate and sanitize date
+          if [ -n "$INPUT_DATE" ]; then
+            if ! [[ "$INPUT_DATE" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]]; then
+              echo "ERROR: Invalid date format '$INPUT_DATE'. Must be YYYY-MM-DD." >&2
+              exit 1
+            fi
+            CALCULATED_DATE="$INPUT_DATE"
+          else
+            CALCULATED_DATE=$(TZ="Asia/Ho_Chi_Minh" date +%Y-%m-%d)
+          fi
+          echo "date=$CALCULATED_DATE" >> $GITHUB_OUTPUT
+          echo "Target Accounting Date (Asia/Ho_Chi_Minh): $CALCULATED_DATE"
+
+          # Determine mode and flags
+          if [ "$EVENT_NAME" = "schedule" ]; then
+            RUN_MODE="afternoon_37slots"
+            IS_DRY_RUN="false"
+            ALLOW_INIT="false"
+          else
+            case "$INPUT_MODE" in
+              trial_3slots|afternoon_37slots) RUN_MODE="$INPUT_MODE" ;;
+              *) echo "ERROR: Unknown mode '$INPUT_MODE'" >&2; exit 1 ;;
+            esac
+            IS_DRY_RUN="${INPUT_DRY_RUN:-true}"
+            ALLOW_INIT="${INPUT_ALLOW_INIT:-false}"
+          fi
+          echo "mode=$RUN_MODE" >> $GITHUB_OUTPUT
+          echo "dry_run=$IS_DRY_RUN" >> $GITHUB_OUTPUT
+          echo "allow_init=$ALLOW_INIT" >> $GITHUB_OUTPUT
+
+      - name: Restore Persistent State Ledger Cache
+        uses: actions/cache/restore@v4
+        id: state-cache
+        with:
+          path: |
+            .local/pilots/study_13paths/state
+            artifacts/checkpoints
+          key: traffic-state-ledger-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            traffic-state-ledger-
+
+      - name: Retrieve Latest State Checkpoint Artifact (Fallback or Supersede)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CURRENT_RUN_ID: ${{ github.run_id }}
+        run: |
+          echo "Inspecting recent workflow runs for state checkpoint artifacts..."
+          mkdir -p artifacts/checkpoints
+          python - << 'PYEOF'
+          import os, subprocess, json, sys, shutil, tarfile
+          from pathlib import Path
+          from scripts.manage_state import inspect_and_select_latest_checkpoint
+
+          token = os.environ.get("GH_TOKEN")
+          repo = os.environ.get("GITHUB_REPOSITORY")
+          if not token or not repo:
+              print("FATAL: GITHUB_TOKEN or GITHUB_REPOSITORY is missing in environment. Cannot verify run history.", file=sys.stderr)
+              sys.exit(1)
+
+          # Query recent runs regardless of conclusion (inspect both successful and failed runs)
+          cmd = [
+              "gh", "run", "list",
+              "--repo", repo,
+              "--workflow", "capture_13paths.yml",
+              "--limit", "15",
+              "--json", "databaseId,status,conclusion,createdAt"
+          ]
+          res = subprocess.run(cmd, capture_output=True, text=True)
+          if res.returncode != 0:
+              print(f"FATAL: Failed to query previous workflow runs via GitHub CLI: {res.stderr}", file=sys.stderr)
+              print("Cannot verify state ledger history due to query failure. Stopping job.", file=sys.stderr)
+              sys.exit(1)
+
+          try:
+              runs = json.loads(res.stdout)
+          except Exception as parse_err:
+              print(f"FATAL: Failed to parse GitHub CLI response: {parse_err}", file=sys.stderr)
+              sys.exit(1)
+
+          # Filter out current running execution before checking if run history is empty
+          current_run_id = os.environ.get("CURRENT_RUN_ID") or os.environ.get("GITHUB_RUN_ID", "")
+          if current_run_id:
+              runs = [r for r in runs if str(r.get("databaseId")) != str(current_run_id)]
+
+          if not runs:
+              print("Confirmed: Repository has no prior workflow runs. Ready for clean bootstrap if authorized.")
+              sys.exit(0)
+
+          newest_prior_run_id = str(runs[0]["databaseId"])
+          tmp_dir = Path("/tmp/run_artifacts_search")
+          tmp_dir.mkdir(parents=True, exist_ok=True)
+          candidate_checkpoints = []
+
+          for run in runs:
+              run_id = str(run["databaseId"])
+              conclusion = run.get("conclusion")
+              created_at = run.get("createdAt", "")
+              print(f"Inspecting run {run_id} ({conclusion} at {created_at})...")
+
+              run_dl_dir = tmp_dir / f"run_{run_id}"
+              dl_cmd = ["gh", "run", "download", run_id, "--repo", repo, "--dir", str(run_dl_dir)]
+              dl_res = subprocess.run(dl_cmd, capture_output=True, text=True)
+              if dl_res.returncode == 0:
+                  chk_files = list(run_dl_dir.glob("**/state_checkpoint.tar.gz"))
+                  if not chk_files and run_id == newest_prior_run_id:
+                      print(f"FATAL: State checkpoint artifact missing in newest prior run '{run_id}'.", file=sys.stderr)
+                      print("Cannot determine latest state ledger. Halting before capture to prevent quota regression.", file=sys.stderr)
+                      shutil.rmtree(tmp_dir, ignore_errors=True)
+                      sys.exit(1)
+                  for chk in chk_files:
+                      candidate_checkpoints.append({
+                          "run_id": run_id,
+                          "created_at": created_at,
+                          "archive_path": chk,
+                      })
+              else:
+                  # If the download failed for the newest prior run B, halt immediately!
+                  if run_id == newest_prior_run_id:
+                      print(
+                          f"FATAL: Failed to download artifacts for newest previous run '{run_id}': {dl_res.stderr.strip()}",
+                          file=sys.stderr
+                      )
+                      print("Cannot determine latest state ledger due to download failure of newest run. Halting.", file=sys.stderr)
+                      shutil.rmtree(tmp_dir, ignore_errors=True)
+                      sys.exit(1)
+                  # For older runs, record error and path
+                  candidate_checkpoints.append({
+                      "run_id": run_id,
+                      "created_at": created_at,
+                      "archive_path": run_dl_dir / "download_failed.tar.gz",
+                      "download_error": dl_res.stderr.strip(),
+                  })
+
+              if len([c for c in candidate_checkpoints if c["archive_path"].is_file()]) >= 3:
+                  break
+
+          if candidate_checkpoints:
+              expected_scope = {"study_id": "hcm_urban_13paths", "registry_version": "main13_20261117_869a0f5a"}
+              try:
+                  best_path, best_manifest = inspect_and_select_latest_checkpoint(candidate_checkpoints, expected_scope)
+                  dest_chk = Path("artifacts/checkpoints/state_checkpoint.tar.gz")
+                  shutil.copy2(best_path, dest_chk)
+                  sha_src = best_path.parent / (best_path.name + ".sha256")
+                  if sha_src.is_file():
+                      shutil.copy2(sha_src, Path("artifacts/checkpoints/state_checkpoint.tar.gz.sha256"))
+                  print(f"SUCCESS: Selected newest valid checkpoint from {best_manifest.get('created_at_utc')}: {dest_chk}")
+                  print(f"  Provenance: study_id={best_manifest.get('study_id')}, registry={best_manifest.get('registry_version')}")
+                  print(f"  Cumulative attempts preserved: {best_manifest.get('cumulative_counts')}")
+              except Exception as sel_err:
+                  print(f"FATAL: State checkpoint selection error: {sel_err}", file=sys.stderr)
+                  shutil.rmtree(tmp_dir, ignore_errors=True)
+                  sys.exit(1)
+          else:
+              print("No candidate checkpoints found across previous runs.")
+
+          shutil.rmtree(tmp_dir, ignore_errors=True)
+          PYEOF
+
+      - name: Verify and Reconcile State Ledger
+        id: verify-state
+        env:
+          STATE_FILE: ${{ steps.run-scope.outputs.state_file }}
+          ALLOW_INIT: ${{ steps.run-scope.outputs.allow_init }}
+          TARGET_DATE: ${{ steps.run-scope.outputs.date }}
+          IMPORT_SOURCE: ${{ inputs.import_external_source }}
+          IMPORT_DATE: ${{ inputs.import_date }}
+          IMPORT_TRAFFIC: ${{ inputs.import_traffic }}
+          IMPORT_WEATHER: ${{ inputs.import_weather }}
+        run: |
+          ALLOW_INIT_ARG=""
+          if [ "$ALLOW_INIT" = "true" ]; then
+            ALLOW_INIT_ARG="--allow-init"
+          fi
+
+          CHECKPOINT_ARCHIVE="artifacts/checkpoints/state_checkpoint.tar.gz"
+          CHECKPOINT_ARG=""
+          if [ -f "$CHECKPOINT_ARCHIVE" ]; then
+            CHECKPOINT_ARG="--checkpoint-archive $CHECKPOINT_ARCHIVE"
+          fi
+
+          python scripts/manage_state.py verify-restore \
+            --state-file "$STATE_FILE" \
+            $CHECKPOINT_ARG \
+            $ALLOW_INIT_ARG \
+            --study-id "hcm_urban_13paths" \
+            --registry-version "main13_20261117_869a0f5a"
+
+          # Reconcile external usage if requested
+          if [ -n "$IMPORT_SOURCE" ]; then
+            if ! [[ "$IMPORT_SOURCE" =~ ^[a-zA-Z0-9_.-]+$ ]]; then
+              echo "ERROR: Invalid source_id '$IMPORT_SOURCE'. Allowed characters: alphanumeric, _, ., -" >&2
+              exit 1
+            fi
+
+            RECONCILE_DATE="$IMPORT_DATE"
+            if [ -z "$RECONCILE_DATE" ]; then
+              RECONCILE_DATE="2026-11-18"
+            fi
+            if ! [[ "$RECONCILE_DATE" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]]; then
+              echo "ERROR: Invalid import_date '$RECONCILE_DATE'. Must be YYYY-MM-DD." >&2
+              exit 1
+            fi
+
+            COUNT_TRAFFIC="${IMPORT_TRAFFIC:-0}"
+            COUNT_WEATHER="${IMPORT_WEATHER:-0}"
+            if ! [[ "$COUNT_TRAFFIC" =~ ^[0-9]+$ ]] || ! [[ "$COUNT_WEATHER" =~ ^[0-9]+$ ]]; then
+              echo "ERROR: Attempt counts must be non-negative integers: traffic=$COUNT_TRAFFIC, weather=$COUNT_WEATHER" >&2
+              exit 1
+            fi
+
+            echo "Reconciling external usage from source '$IMPORT_SOURCE' on date '$RECONCILE_DATE'..."
+            python scripts/manage_state.py import-usage \
+              --state-file "$STATE_FILE" \
+              --source-id "$IMPORT_SOURCE" \
+              --date "$RECONCILE_DATE" \
+              --traffic "$COUNT_TRAFFIC" \
+              --weather "$COUNT_WEATHER" \
+              --timezone "$TZ"
+          fi
+
+          python scripts/manage_state.py summary \
+            --state-file "$STATE_FILE" \
+            --date "$TARGET_DATE" \
+            --timezone "$TZ"
+
+          echo "state_verified=true" >> $GITHUB_OUTPUT
+
+      - name: Run Doctor Diagnostic
+        run: |
+          python main.py --config $STUDY_CONFIG doctor
+
+      - name: Execute Capture Run (Trial or Afternoon)
+        id: execute-step
+        env:
+          DATE: ${{ steps.run-scope.outputs.date }}
+          MODE: ${{ steps.run-scope.outputs.mode }}
+          STATE_FILE: ${{ steps.run-scope.outputs.state_file }}
+          DRY_RUN: ${{ steps.run-scope.outputs.dry_run }}
+        run: |
+          DRY_RUN_ARG=""
+          if [ "$DRY_RUN" = "true" ]; then
+            DRY_RUN_ARG="--dry-run"
+          fi
+
+          if [ "$MODE" = "trial_3slots" ]; then
+            echo "Executing in TRIAL mode (3 slots, dynamic future schedule)..."
+            python scripts/run_runner_trial.py \
+              --date "$DATE" \
+              --base-config "$STUDY_CONFIG" \
+              --state-file "$STATE_FILE" \
+              --allow-online \
+              $DRY_RUN_ARG
+          else
+            echo "Executing in AFTERNOON PRODUCTION mode (37 slots, 16:00-19:00)..."
+            if [ "$DRY_RUN" = "true" ]; then
+              python main.py --config "$STUDY_CONFIG" capture dry-run \
+                --plan data/reference/plans/38b28d4596ca3dc3d4ea.json \
+                --date "$DATE" \
+                --allow-online
+            else
+              python main.py --config "$STUDY_CONFIG" run \
+                --date "$DATE" \
+                --allow-online
+            fi
+            echo "actual_date=$DATE" >> $GITHUB_OUTPUT
+            echo "trial_root=.local/pilots/study_13paths" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Create State Checkpoint
+        if: always() && steps.verify-state.outputs.state_verified == 'true'
+        env:
+          STATE_FILE: ${{ steps.run-scope.outputs.state_file }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+          BRANCH: ${{ github.ref_name }}
+          WORKFLOW_NAME: ${{ github.workflow }}
+        run: |
+          if [ -f "$STATE_FILE" ]; then
+            echo "Creating persistent state checkpoint..."
+            python scripts/manage_state.py create-checkpoint \
+              --state-file "$STATE_FILE" \
+              --checkpoint-dir artifacts/checkpoints \
+              --study-id "hcm_urban_13paths" \
+              --registry-version "main13_20261117_869a0f5a" \
+              --run-id "$RUN_ID" \
+              --run-attempt "$RUN_ATTEMPT" \
+              --branch "$BRANCH" \
+              --workflow "$WORKFLOW_NAME"
+          fi
+
+      - name: Package Complete Run Artifacts
+        if: always() && steps.verify-state.outputs.state_verified == 'true'
+        env:
+          STATE_FILE: ${{ steps.run-scope.outputs.state_file }}
+          ACTUAL_DATE: ${{ steps.execute-step.outputs.actual_date || steps.run-scope.outputs.date }}
+          TRIAL_ROOT: ${{ steps.execute-step.outputs.trial_root }}
+          SESSION_ID: ${{ steps.execute-step.outputs.session_id }}
+          MODE: ${{ steps.run-scope.outputs.mode }}
+          RUN_STATUS: ${{ steps.execute-step.outcome == 'success' && 'completed' || 'failed' }}
+          DRY_RUN: ${{ steps.run-scope.outputs.dry_run }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+          GIT_SHA: ${{ github.sha }}
+        run: |
+          if [ -f "$STATE_FILE" ]; then
+            PILOT_ARG=""
+            if [ -n "$TRIAL_ROOT" ] && [ -d "$TRIAL_ROOT" ]; then
+              PILOT_ARG="--pilot-root $TRIAL_ROOT"
+            fi
+
+            DRY_RUN_ARG=""
+            if [ "$DRY_RUN" = "true" ]; then
+              DRY_RUN_ARG="--dry-run"
+            fi
+
+            echo "Packaging publication tables, raw payloads, audits, and state..."
+            python scripts/archive_run_artifacts.py \
+              --config-file "$STUDY_CONFIG" \
+              --mode "$MODE" \
+              --date "$ACTUAL_DATE" \
+              --state-file "$STATE_FILE" \
+              --output-dir artifacts/run_bundles \
+              --run-id "$RUN_ID" \
+              --run-attempt "$RUN_ATTEMPT" \
+              --git-sha "$GIT_SHA" \
+              --status "$RUN_STATUS" \
+              $PILOT_ARG \
+              $DRY_RUN_ARG
+          fi
+
+      - name: Save Persistent State Ledger Cache
+        if: always() && steps.verify-state.outputs.state_verified == 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            .local/pilots/study_13paths/state
+            artifacts/checkpoints
+          key: traffic-state-ledger-${{ github.run_id }}-${{ github.run_attempt }}
+
+      - name: Generate Job Summary
+        if: always()
+        env:
+          TARGET_DATE: ${{ steps.execute-step.outputs.actual_date || steps.run-scope.outputs.date }}
+          MODE: ${{ steps.run-scope.outputs.mode }}
+          DRY_RUN: ${{ steps.run-scope.outputs.dry_run }}
+          TRIAL_ROOT: ${{ steps.execute-step.outputs.trial_root }}
+        run: |
+          python - << 'EOF'
+          import csv, json, os, sys
+          from pathlib import Path
+
+          summary_path = os.environ.get("GITHUB_STEP_SUMMARY")
+          if not summary_path:
+              sys.exit(0)
+
+          target_date = os.environ.get("TARGET_DATE", "Unknown")
+          mode = os.environ.get("MODE", "Unknown")
+          dry_run = os.environ.get("DRY_RUN", "false")
+          trial_root_env = os.environ.get("TRIAL_ROOT")
+
+          lines = []
+          lines.append("# HCM-Traffic 13-Path Run Summary")
+          lines.append(f"**Execution Mode:** `{mode}` | **Target Date:** `{target_date}` | **Timezone:** `Asia/Ho_Chi_Minh` | **Dry Run:** `{dry_run}`\n")
+
+          if trial_root_env and Path(trial_root_env).is_dir():
+              pub_dirs = [Path(trial_root_env)]
+          else:
+              pub_dirs = [Path(".local/pilots/study_13paths")]
+
+          found_data = False
+          for p_root in pub_dirs:
+              pub_csvs = list(p_root.glob("**/observations_full.csv"))
+              for pub_file in pub_csvs:
+                  if pub_file.is_file():
+                      found_data = True
+                      with open(pub_file, "r", encoding="utf-8-sig") as f:
+                          rows = list(csv.DictReader(f))
+                      day_rows = [r for r in rows if r.get("local_date") == target_date]
+                      slots = sorted(set(r.get("time_slot") for r in day_rows))
+                      paths = sorted(set(r.get("segment_id") for r in day_rows))
+                      speed_nn = sum(r.get("current_speed_kmh") not in (None, "") for r in day_rows)
+                      ci_nn = sum(r.get("ci") not in (None, "") for r in day_rows)
+                      weather_comp = sum(r.get("precipitation_mm") not in (None, "") and r.get("weather_code") not in (None, "") for r in day_rows)
+
+                      session_label = p_root.name
+                      lines.append(f"### Results for Session `{session_label}`")
+                      lines.append(f"- **Total Rows:** {len(day_rows)}")
+                      lines.append(f"- **Distinct Slots:** {len(slots)} ({', '.join(slots)})")
+                      lines.append(f"- **Distinct Paths:** {len(paths)} / 13")
+                      lines.append(f"- **Speed Complete:** {speed_nn} / {len(day_rows)}")
+                      lines.append(f"- **CI Complete:** {ci_nn} / {len(day_rows)}")
+                      lines.append(f"- **Weather Complete:** {weather_comp} / {len(day_rows)}")
+
+                      lines.append("\n| Segment ID | Road Name | Dir | Slot | Speed (km/h) | CI | Geom Cov |")
+                      lines.append("| :--- | :--- | :---: | :---: | :---: | :---: | :---: |")
+                      for r in day_rows[:13]:
+                          lines.append(f"| `{r.get('segment_id')}` | {r.get('road_name')} | {r.get('direction_id')} | {r.get('time_slot')} | {r.get('current_speed_kmh')} | {r.get('ci')} | {float(r.get('geometry_coverage', 0)):.4f} |")
+
+          if not found_data:
+              lines.append("> [!INFO]\n> No observations published. (Normal for dry-run or preflight aborts). Check step logs for diagnostic preflight results.")
+
+          bundle_dir = Path("artifacts/run_bundles")
+          if bundle_dir.is_dir():
+              bundles = list(bundle_dir.glob("*.tar.gz"))
+              if bundles:
+                  lines.append("\n### Run Artifacts Archive")
+                  for b in bundles:
+                      lines.append(f"- Archive: `{b.name}` ({b.stat().st_size / (1024*1024):.2f} MB)")
+
+          with open(summary_path, "a", encoding="utf-8") as f:
+              f.write("\n".join(lines) + "\n")
+          EOF
+
+      - name: Upload Run Artifacts and Checkpoint
+        if: always() && steps.verify-state.outputs.state_verified == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: capture-outputs-${{ steps.run-scope.outputs.mode }}-${{ steps.run-scope.outputs.date }}-run${{ github.run_id }}
+          path: |
+            artifacts/run_bundles/
+            artifacts/checkpoints/
+            logs/
+          if-no-files-found: warn
+          retention-days: 90
