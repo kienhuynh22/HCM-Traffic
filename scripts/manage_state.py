@@ -379,6 +379,51 @@ def restore_checkpoint(
                 pass
 
 
+def verify_run_stopped_before_ledger(
+    jobs_data: list[dict],
+    ledger_step_name: str = "Verify and Reconcile State Ledger",
+) -> tuple[bool, str]:
+    """
+    Given a list of job dicts for a workflow run, determines whether the run
+    is verified to have stopped BEFORE touching or modifying the state ledger.
+
+    Returns:
+        (stopped_before_ledger: bool, reason: str)
+        If True, the run is guaranteed to have never executed or started the ledger step.
+        If False, the run reached the ledger step or its status cannot be verified.
+    """
+    if not jobs_data or not isinstance(jobs_data, list):
+        return False, "No jobs data available or invalid format"
+
+    for job in jobs_data:
+        if not isinstance(job, dict):
+            return False, f"Invalid job record format: {type(job)}"
+
+        # 1. Job never picked up by any runner (cancelled while queued)
+        runner_id = job.get("runner_id", 0)
+        runner_name = job.get("runner_name", "")
+        if runner_id == 0 or not runner_name:
+            continue
+
+        steps = job.get("steps", [])
+        if not steps:
+            # Runner was assigned, but steps list is empty (ambiguous / unknown execution state)
+            return False, f"Runner '{runner_name}' was assigned but step list is empty"
+
+        # Check steps in execution order
+        for step in steps:
+            if step.get("name") == ledger_step_name:
+                conclusion = step.get("conclusion")
+                status = step.get("status")
+                # If conclusion is 'skipped', the step was never executed
+                if conclusion == "skipped":
+                    break
+                # If step was executed or running
+                return False, f"Step '{ledger_step_name}' was reached (status={status}, conclusion={conclusion})"
+
+    return True, f"Run verified to have stopped before step '{ledger_step_name}'"
+
+
 def inspect_and_select_latest_checkpoint(
     candidates: list,
     expected_scope: dict,
@@ -402,6 +447,7 @@ def inspect_and_select_latest_checkpoint(
                 "created_at": str(item.get("created_at", "")),
                 "archive_path": Path(item["archive_path"]),
                 "download_error": str(item.get("download_error", "")),
+                "stopped_before_ledger": bool(item.get("stopped_before_ledger", False)),
             })
         else:
             p = Path(item)
@@ -410,17 +456,22 @@ def inspect_and_select_latest_checkpoint(
                 "created_at": "",
                 "archive_path": p,
                 "download_error": "",
+                "stopped_before_ledger": False,
             })
 
     # Sort candidates newest first if created_at is present
     if any(n["created_at"] for n in normalized):
         normalized.sort(key=lambda x: x["created_at"], reverse=True)
 
-    newest_run_id = normalized[0]["run_id"]
+    active_candidates = [c for c in normalized if not c.get("stopped_before_ledger")]
+    if not active_candidates:
+        raise ValueError("No active checkpoint candidates provided.")
+
+    newest_run_id = active_candidates[0]["run_id"]
     errors_by_run = {}
     valid_candidates = []
 
-    for item in normalized:
+    for item in active_candidates:
         archive_path = item["archive_path"]
         run_id = item["run_id"]
         dl_err = item.get("download_error")

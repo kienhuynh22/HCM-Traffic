@@ -173,16 +173,18 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           CURRENT_RUN_ID: ${{ github.run_id }}
+          ALLOW_INIT: ${{ steps.run-scope.outputs.allow_init }}
         run: |
           echo "Inspecting recent workflow runs for state checkpoint artifacts..."
           mkdir -p artifacts/checkpoints
           python - << 'PYEOF'
           import os, subprocess, json, sys, shutil, tarfile
           from pathlib import Path
-          from scripts.manage_state import inspect_and_select_latest_checkpoint
+          from scripts.manage_state import inspect_and_select_latest_checkpoint, verify_run_stopped_before_ledger
 
           token = os.environ.get("GH_TOKEN")
           repo = os.environ.get("GITHUB_REPOSITORY")
+          allow_init = os.environ.get("ALLOW_INIT", "false").lower() == "true"
           if not token or not repo:
               print("FATAL: GITHUB_TOKEN or GITHUB_REPOSITORY is missing in environment. Cannot verify run history.", file=sys.stderr)
               sys.exit(1)
@@ -216,7 +218,16 @@ jobs:
               print("Confirmed: Repository has no prior workflow runs. Ready for clean bootstrap if authorized.")
               sys.exit(0)
 
-          newest_prior_run_id = str(runs[0]["databaseId"])
+          def get_run_jobs(target_run_id: str) -> list:
+              j_cmd = ["gh", "api", f"repos/{repo}/actions/runs/{target_run_id}/jobs", "--jq", ".jobs"]
+              j_res = subprocess.run(j_cmd, capture_output=True, text=True)
+              if j_res.returncode == 0:
+                  try:
+                      return json.loads(j_res.stdout)
+                  except Exception:
+                      return []
+              return []
+
           tmp_dir = Path("/tmp/run_artifacts_search")
           tmp_dir.mkdir(parents=True, exist_ok=True)
           candidate_checkpoints = []
@@ -230,13 +241,10 @@ jobs:
               run_dl_dir = tmp_dir / f"run_{run_id}"
               dl_cmd = ["gh", "run", "download", run_id, "--repo", repo, "--dir", str(run_dl_dir)]
               dl_res = subprocess.run(dl_cmd, capture_output=True, text=True)
-              if dl_res.returncode == 0:
-                  chk_files = list(run_dl_dir.glob("**/state_checkpoint.tar.gz"))
-                  if not chk_files and run_id == newest_prior_run_id:
-                      print(f"FATAL: State checkpoint artifact missing in newest prior run '{run_id}'.", file=sys.stderr)
-                      print("Cannot determine latest state ledger. Halting before capture to prevent quota regression.", file=sys.stderr)
-                      shutil.rmtree(tmp_dir, ignore_errors=True)
-                      sys.exit(1)
+              chk_files = list(run_dl_dir.glob("**/state_checkpoint.tar.gz")) if dl_res.returncode == 0 else []
+
+              if chk_files:
+                  print(f"Found checkpoint artifact in run {run_id}.")
                   for chk in chk_files:
                       candidate_checkpoints.append({
                           "run_id": run_id,
@@ -244,22 +252,17 @@ jobs:
                           "archive_path": chk,
                       })
               else:
-                  # If the download failed for the newest prior run B, halt immediately!
-                  if run_id == newest_prior_run_id:
-                      print(
-                          f"FATAL: Failed to download artifacts for newest previous run '{run_id}': {dl_res.stderr.strip()}",
-                          file=sys.stderr
-                      )
-                      print("Cannot determine latest state ledger due to download failure of newest run. Halting.", file=sys.stderr)
+                  # No checkpoint artifact found. Check if run stopped before touching state ledger.
+                  jobs_data = get_run_jobs(run_id)
+                  stopped_before, reason = verify_run_stopped_before_ledger(jobs_data)
+                  if stopped_before:
+                      print(f"Run {run_id} has no checkpoint, but verified stopped before touching ledger: {reason}. Skipping safely.")
+                      continue
+                  else:
+                      print(f"FATAL: Run '{run_id}' has no checkpoint artifact and may have modified the state ledger: {reason}", file=sys.stderr)
+                      print("Cannot safely determine latest state ledger. Halting before capture to prevent quota regression.", file=sys.stderr)
                       shutil.rmtree(tmp_dir, ignore_errors=True)
                       sys.exit(1)
-                  # For older runs, record error and path
-                  candidate_checkpoints.append({
-                      "run_id": run_id,
-                      "created_at": created_at,
-                      "archive_path": run_dl_dir / "download_failed.tar.gz",
-                      "download_error": dl_res.stderr.strip(),
-                  })
 
               if len([c for c in candidate_checkpoints if c["archive_path"].is_file()]) >= 3:
                   break
@@ -281,7 +284,14 @@ jobs:
                   shutil.rmtree(tmp_dir, ignore_errors=True)
                   sys.exit(1)
           else:
-              print("No candidate checkpoints found across previous runs.")
+              # All previous runs in history stopped before touching the ledger!
+              if allow_init:
+                  print("Confirmed: All previous workflow runs stopped before touching ledger. Ready for clean bootstrap since allow_init_state=True.")
+              else:
+                  print("FATAL: No state checkpoint found across previous runs and allow_init_state is False.", file=sys.stderr)
+                  print("Silently resetting daily usage budget is prohibited. Halting before capture.", file=sys.stderr)
+                  shutil.rmtree(tmp_dir, ignore_errors=True)
+                  sys.exit(1)
 
           shutil.rmtree(tmp_dir, ignore_errors=True)
           PYEOF
