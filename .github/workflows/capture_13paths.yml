@@ -47,14 +47,11 @@ on:
         type: number
         default: 0
 
-  # Scheduled runs for afternoon window: 16:00 - 19:00 VN (37 slots, 5-minute intervals).
-  # 16:00 Asia/Ho_Chi_Minh = 09:00 UTC.
-  # Starting at 08:50 UTC (15:50 VN) provides a 10-minute margin for runner spinup,
-  # dependency loading, integrity verification, and precise Python scheduler sync.
-  #
-  # NOTE: Kept commented out / disabled until manual workflow_dispatch test run succeeds.
-  # schedule:
-  #   - cron: '50 8 * * *'
+  # Daily scheduled pilot run for afternoon window: 16:00 - 19:00 VN (37 slots, 5-minute intervals).
+  # 08:40 UTC = 15:40 Asia/Ho_Chi_Minh (provides 20-minute margin for runner spinup,
+  # dependency caching, reference inputs download, and state ledger reconciliation before 16:00 slot 1).
+  schedule:
+    - cron: '40 8 * * *'
 
 concurrency:
   group: capture-13paths
