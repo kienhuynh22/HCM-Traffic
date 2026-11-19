@@ -720,6 +720,104 @@ class TestOfflinePipelineVerification(unittest.TestCase):
         self.assertFalse(stopped_a)
         self.assertIn("step list is empty", reason_a)
 
+    # --------------------------------------------------------------------------
+    # 13. Scheduled Pilot Workflow Invariants and Afternoon Execution Path
+    # --------------------------------------------------------------------------
+    def test_13_workflow_schedule_mode_and_invariants(self):
+        import yaml
+        from datetime import datetime
+        from zoneinfo import ZoneInfo
+        from src.config import load_config
+        import tempfile
+        import subprocess
+
+        # 1. Verify workflow YAML triggers and concurrency
+        wf_path = Path(".github/workflows/capture_13paths.yml")
+        self.assertTrue(wf_path.is_file())
+        with open(wf_path, "r", encoding="utf-8") as f:
+            wf = yaml.safe_load(f)
+
+        triggers = wf.get("on") or wf.get(True) or {}
+        self.assertIn("schedule", triggers)
+        self.assertIn("workflow_dispatch", triggers)
+
+        # Cron verification: 40 8 * * * (08:40 UTC = 15:40 ICT)
+        schedules = triggers["schedule"]
+        self.assertTrue(any(s.get("cron") == "40 8 * * *" for s in schedules))
+
+        # Concurrency verification: single job in group capture-13paths, no cancel
+        concurrency = wf.get("concurrency", {})
+        self.assertEqual(concurrency.get("group"), "capture-13paths")
+        self.assertFalse(concurrency.get("cancel-in-progress", True))
+
+        # 2. Verify CI study configuration for 16:00 - 19:00 afternoon window
+        cfg = load_config(Path("config/ci/study_13paths.yaml"))
+        self.assertEqual(cfg.study.timezone, "Asia/Ho_Chi_Minh")
+        self.assertEqual(len(cfg.study.slots), 37)
+        self.assertEqual(cfg.study.slots[0], "16:00")
+        self.assertEqual(cfg.study.slots[-1], "19:00")
+        # Ensure 5-minute spacing throughout
+        t_prev = None
+        for s in cfg.study.slots:
+            h, m = map(int, s.split(":"))
+            t_curr = h * 60 + m
+            if t_prev is not None:
+                self.assertEqual(t_curr - t_prev, 5)
+            t_prev = t_curr
+
+        # Budget caps cover 37 slots at 11 traffic tiles and 13 weather endpoints (worst-case 3 attempts)
+        self.assertGreaterEqual(cfg.budget.traffic_daily_attempt_cap, 37 * 11 * 3)
+        self.assertGreaterEqual(cfg.budget.weather_daily_attempt_cap, 37 * 13 * 3)
+
+        # 3. Simulate schedule event parameters vs workflow_dispatch
+        def resolve_run_scope(event_name, input_mode=None, input_dry_run=None, input_allow_init=None, input_date=None):
+            if event_name == "schedule":
+                run_mode = "afternoon_37slots"
+                is_dry_run = False
+                allow_init = False
+            else:
+                run_mode = input_mode or "trial_3slots"
+                is_dry_run = input_dry_run if input_dry_run is not None else True
+                allow_init = input_allow_init if input_allow_init is not None else False
+
+            tz_vn = ZoneInfo("Asia/Ho_Chi_Minh")
+            if input_date:
+                calc_date = input_date
+            else:
+                calc_date = datetime.now(tz_vn).strftime("%Y-%m-%d")
+
+            return {
+                "mode": run_mode,
+                "dry_run": is_dry_run,
+                "allow_init": allow_init,
+                "date": calc_date,
+            }
+
+        sched_scope = resolve_run_scope("schedule")
+        self.assertEqual(sched_scope["mode"], "afternoon_37slots")
+        self.assertFalse(sched_scope["dry_run"])
+        self.assertFalse(sched_scope["allow_init"])
+        self.assertRegex(sched_scope["date"], r"^\d{4}-\d{2}-\d{2}$")
+
+        # 4. Packaging test for afternoon_37slots mode via archive_run_artifacts
+        from scripts.archive_run_artifacts import find_files_to_archive
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            pilot_root = tmp_path / ".local" / "pilots" / "study_13paths"
+            (pilot_root / "interim" / "publication").mkdir(parents=True, exist_ok=True)
+            (pilot_root / "raw" / "hcm_urban_13paths" / "2026-11-19").mkdir(parents=True, exist_ok=True)
+
+            obs_file = pilot_root / "interim" / "publication" / "observations_full.csv"
+            obs_file.write_text("segment_id,road_name,direction_id,time_slot\nseg_1,Road A,1,16:00\n", encoding="utf-8")
+
+            raw_file = pilot_root / "raw" / "hcm_urban_13paths" / "2026-11-19" / "inventory_test.json"
+            raw_file.write_text('{"collection_kind": "scheduled"}', encoding="utf-8")
+
+            items = find_files_to_archive(pilot_root, "2026-11-19")
+            archived_rel_paths = [rel for _, rel in items]
+            self.assertIn("publication/observations_full.csv", archived_rel_paths)
+            self.assertIn("raw/hcm_urban_13paths/2026-11-19/inventory_test.json", archived_rel_paths)
+
 
 if __name__ == "__main__":
     unittest.main()
