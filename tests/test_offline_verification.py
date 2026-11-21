@@ -818,6 +818,180 @@ class TestOfflinePipelineVerification(unittest.TestCase):
             self.assertIn("publication/observations_full.csv", archived_rel_paths)
             self.assertIn("raw/hcm_urban_13paths/2026-11-19/inventory_test.json", archived_rel_paths)
 
+    # --------------------------------------------------------------------------
+    # 14. Guard Scenario: 00:14 Out-of-Window Automated Run Halts Early
+    # --------------------------------------------------------------------------
+    def test_14_guard_out_of_window_at_0014_halts_early_and_allows_subsequent_restore(self):
+        from scripts.check_run_guard import check_startup_window
+        from scripts.manage_state import verify_run_stopped_before_ledger
+        from zoneinfo import ZoneInfo
+        from datetime import datetime
+
+        # Simulate run starting at 00:14:17 Asia/Ho_Chi_Minh (like Run #10)
+        dt_0014 = datetime(2026, 11, 21, 0, 14, 17, tzinfo=ZoneInfo("Asia/Ho_Chi_Minh"))
+
+        # 1. Startup window check must reject this automated run
+        is_valid, reason = check_startup_window(
+            event_name="schedule",
+            mode="afternoon_37slots",
+            is_automated=True,
+            now_dt=dt_0014,
+        )
+        self.assertFalse(is_valid)
+        self.assertIn("outside startup window", reason)
+        self.assertIn("00:14:17", reason)
+
+        # 2. Simulated workflow job that halted early due to out-of-window check
+        # 'Verify and Reconcile State Ledger' was never executed (conclusion is 'skipped')
+        job_halted_early = [{
+            "runner_id": 101,
+            "runner_name": "GitHub Actions",
+            "steps": [
+                {"name": "Checkout repository", "status": "completed", "conclusion": "success"},
+                {"name": "Determine Run Scope and State Path", "status": "completed", "conclusion": "success"},
+                {"name": "Restore Persistent State Ledger Cache", "status": "completed", "conclusion": "skipped"},
+                {"name": "Retrieve Latest State Checkpoint Artifact (Fallback or Supersede)", "status": "completed", "conclusion": "skipped"},
+                {"name": "Check for Duplicate Live Capture on Same Date", "status": "completed", "conclusion": "skipped"},
+                {"name": "Verify and Reconcile State Ledger", "status": "completed", "conclusion": "skipped"},
+                {"name": "Execute Capture Run (Trial or Afternoon)", "status": "completed", "conclusion": "skipped"},
+                {"name": "Generate Job Summary", "status": "completed", "conclusion": "success"},
+            ]
+        }]
+
+        # 3. verify_run_stopped_before_ledger MUST verify that this run stopped before ledger!
+        stopped_before, stop_reason = verify_run_stopped_before_ledger(job_halted_early)
+        self.assertTrue(stopped_before)
+        self.assertIn("stopped before step 'Verify and Reconcile State Ledger'", stop_reason)
+
+    # --------------------------------------------------------------------------
+    # 15. Guard Scenario: Cron Arriving On Time (15:40) Proceeds Normally
+    # --------------------------------------------------------------------------
+    def test_15_guard_on_time_cron_proceeds(self):
+        from scripts.check_run_guard import check_startup_window, check_duplicate_live_capture
+        from zoneinfo import ZoneInfo
+        from datetime import datetime
+        import tempfile
+        from src.storage.state import State
+        import shutil
+
+        # Simulate on-time run at 15:40:00 Asia/Ho_Chi_Minh
+        dt_1540 = datetime(2026, 11, 21, 15, 40, 0, tzinfo=ZoneInfo("Asia/Ho_Chi_Minh"))
+
+        # 1. Startup window check must pass
+        is_valid, reason = check_startup_window(
+            event_name="schedule",
+            mode="afternoon_37slots",
+            is_automated=True,
+            now_dt=dt_1540,
+        )
+        self.assertTrue(is_valid)
+        self.assertIn("within valid launch window", reason)
+
+        # 2. Duplicate check on a clean ledger (no prior live attempts for today)
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            db_path = Path(tmp_dir) / "capture.sqlite"
+            State(db_path) # creates empty schema
+
+            is_dup, dup_reason = check_duplicate_live_capture(
+                db_path,
+                target_date="2026-11-21",
+                mode="afternoon_37slots",
+                dry_run=False,
+            )
+            self.assertFalse(is_dup)
+            self.assertIn("No prior live capture found", dup_reason)
+
+    # --------------------------------------------------------------------------
+    # 16. Guard Scenario: Cron Arriving After Fallback Run Is Prevented From Duplicate
+    # --------------------------------------------------------------------------
+    def test_16_guard_cron_arriving_after_fallback_is_prevented_from_duplicate_capture(self):
+        from scripts.check_run_guard import check_duplicate_live_capture, inspect_checkpoint_archive_for_duplicate
+        from scripts.manage_state import import_external_usage, create_checkpoint
+        from src.storage.state import State
+        from datetime import date
+        import tempfile
+        import sqlite3
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            db_path = tmp_path / "capture.sqlite"
+            state = State(db_path)
+
+            # Fallback run dispatched at 15:45 and completed capture for 2026-11-21
+            # Recording 407 traffic attempts and completed slot in ledger
+            import_external_usage(db_path, "fallback_session_run", date(2026, 11, 21), 407, 481, allow_init=True)
+            with state.connect() as db:
+                db.execute(
+                    "INSERT INTO slots(study, registry, scheduled, snapshot, status) VALUES (?, ?, ?, ?, ?)",
+                    ("hcm_urban_13paths", "main13_20261117_869a0f5a", "2026-11-21T09:00:00+00:00", "snap_1600", "complete")
+                )
+
+            # 1. Direct DB check on restored ledger detects duplicate
+            is_dup, reason = check_duplicate_live_capture(
+                db_path,
+                target_date="2026-11-21",
+                mode="afternoon_37slots",
+                dry_run=False,
+            )
+            self.assertTrue(is_dup)
+            self.assertIn("already completed in state ledger", reason)
+            self.assertIn("traffic_attempts=407", reason)
+
+            # 2. Checkpoint archive check also detects duplicate
+            chk_dir = tmp_path / "checkpoints"
+            meta = {
+                "study_id": "hcm_urban_13paths",
+                "registry_version": "main13_20261117_869a0f5a",
+                "run_id": "999",
+            }
+            chk_file = create_checkpoint(
+                db_path,
+                chk_dir,
+                meta,
+            )
+            is_dup_chk, reason_chk = inspect_checkpoint_archive_for_duplicate(
+                chk_file,
+                target_date="2026-11-21",
+                mode="afternoon_37slots",
+                dry_run=False,
+            )
+            self.assertTrue(is_dup_chk)
+            self.assertIn("already completed in state ledger", reason_chk)
+
+    # --------------------------------------------------------------------------
+    # 17. Guard Scenario: Same-Day Dry Run Does NOT Block Live Afternoon Run
+    # --------------------------------------------------------------------------
+    def test_17_guard_same_day_dry_run_does_not_block_live_session(self):
+        from scripts.check_run_guard import check_duplicate_live_capture
+        from src.storage.state import State
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            db_path = tmp_path / "capture.sqlite"
+            State(db_path) # dry run touched nothing or 0 attempts
+
+            # 1. When a dry-run itself is evaluated, duplicate check is skipped
+            is_dup_dry, reason_dry = check_duplicate_live_capture(
+                db_path,
+                target_date="2026-11-21",
+                mode="afternoon_37slots",
+                dry_run=True,
+            )
+            self.assertFalse(is_dup_dry)
+            self.assertIn("dry_run=True", reason_dry)
+
+            # 2. When the live run evaluates the ledger after a prior dry run:
+            # 0 attempts and 0 slots for 2026-11-21
+            is_dup_live, reason_live = check_duplicate_live_capture(
+                db_path,
+                target_date="2026-11-21",
+                mode="afternoon_37slots",
+                dry_run=False,
+            )
+            self.assertFalse(is_dup_live)
+            self.assertIn("No prior live capture found", reason_live)
+
 
 if __name__ == "__main__":
     unittest.main()

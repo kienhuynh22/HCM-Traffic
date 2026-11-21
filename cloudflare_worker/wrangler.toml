@@ -1,0 +1,12 @@
+name = "hcm-traffic-scheduler-guard"
+main = "src/index.js"
+compatibility_date = "2024-11-01"
+
+[triggers]
+crons = ["45 8 * * *"] # 08:45 UTC = 15:45 Asia/Ho_Chi_Minh daily
+
+[vars]
+GITHUB_REPO = "kienhuynh22/HCM-Traffic"
+WORKFLOW_FILE = "capture_13paths.yml"
+TARGET_BRANCH = "master"
+TARGET_TIMEZONE = "Asia/Ho_Chi_Minh"
