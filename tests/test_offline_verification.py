@@ -899,18 +899,16 @@ class TestOfflinePipelineVerification(unittest.TestCase):
                 dry_run=False,
             )
             self.assertFalse(is_dup)
-            self.assertIn("No prior live capture found", dup_reason)
+            self.assertIn("No prior production live capture found", dup_reason)
 
     # --------------------------------------------------------------------------
     # 16. Guard Scenario: Cron Arriving After Fallback Run Is Prevented From Duplicate
     # --------------------------------------------------------------------------
     def test_16_guard_cron_arriving_after_fallback_is_prevented_from_duplicate_capture(self):
         from scripts.check_run_guard import check_duplicate_live_capture, inspect_checkpoint_archive_for_duplicate
-        from scripts.manage_state import import_external_usage, create_checkpoint
+        from scripts.manage_state import create_checkpoint
         from src.storage.state import State
-        from datetime import date
         import tempfile
-        import sqlite3
 
         with tempfile.TemporaryDirectory() as tmp_dir:
             tmp_path = Path(tmp_dir)
@@ -918,13 +916,16 @@ class TestOfflinePipelineVerification(unittest.TestCase):
             state = State(db_path)
 
             # Fallback run dispatched at 15:45 and completed capture for 2026-11-21
-            # Recording 407 traffic attempts and completed slot in ledger
-            import_external_usage(db_path, "fallback_session_run", date(2026, 11, 21), 407, 481, allow_init=True)
             with state.connect() as db:
                 db.execute(
                     "INSERT INTO slots(study, registry, scheduled, snapshot, status) VALUES (?, ?, ?, ?, ?)",
                     ("hcm_urban_13paths", "main13_20261117_869a0f5a", "2026-11-21T09:00:00+00:00", "snap_1600", "complete")
                 )
+                for idx in range(11):
+                    db.execute(
+                        "INSERT INTO attempts(scope, provider, snapshot, resource, number, reserved_at, outcome) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                        ("daily_13paths_implementation_v1", "traffic", "snap_1600", f"tile_{idx}", 1, "2026-11-21T09:00:01+00:00", "ok"),
+                    )
 
             # 1. Direct DB check on restored ledger detects duplicate
             is_dup, reason = check_duplicate_live_capture(
@@ -934,8 +935,8 @@ class TestOfflinePipelineVerification(unittest.TestCase):
                 dry_run=False,
             )
             self.assertTrue(is_dup)
-            self.assertIn("already completed in state ledger", reason)
-            self.assertIn("traffic_attempts=407", reason)
+            self.assertIn("already occurred in state ledger", reason)
+            self.assertIn("traffic_attempts=11", reason)
 
             # 2. Checkpoint archive check also detects duplicate
             chk_dir = tmp_path / "checkpoints"
@@ -956,7 +957,7 @@ class TestOfflinePipelineVerification(unittest.TestCase):
                 dry_run=False,
             )
             self.assertTrue(is_dup_chk)
-            self.assertIn("already completed in state ledger", reason_chk)
+            self.assertIn("already occurred in state ledger", reason_chk)
 
     # --------------------------------------------------------------------------
     # 17. Guard Scenario: Same-Day Dry Run Does NOT Block Live Afternoon Run
@@ -990,7 +991,391 @@ class TestOfflinePipelineVerification(unittest.TestCase):
                 dry_run=False,
             )
             self.assertFalse(is_dup_live)
-            self.assertIn("No prior live capture found", reason_live)
+            self.assertIn("No prior production live capture found", reason_live)
+
+    # --------------------------------------------------------------------------
+    # 18. Run #20 (2026-11-26): 36/37 Slots Captured With GitHub Failure
+    # --------------------------------------------------------------------------
+    def test_18_run20_partial_36_of_37_failure_detected_and_blocks_recapture(self):
+        from scripts.check_run_guard import (
+            check_duplicate_live_capture,
+            inspect_checkpoint_archive_for_duplicate,
+            check_github_actions_for_duplicate,
+        )
+        from scripts.manage_state import create_checkpoint
+        from src.storage.state import State
+        import json
+        import os
+        import tempfile
+        import unittest.mock
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            db_path = tmp_path / "capture.sqlite"
+            state = State(db_path)
+
+            # Populate Run #20 scenario: 2026-11-26 has 1 missed (16:00) + 36 complete (16:05..19:00)
+            with state.connect() as db:
+                db.execute(
+                    "INSERT INTO slots(study, registry, scheduled, snapshot, status) VALUES (?, ?, ?, ?, ?)",
+                    ("hcm_urban_13paths", "main13_20261117_869a0f5a", "2026-11-26T09:00:00+00:00", "snap_missed", "missed"),
+                )
+                for idx in range(1, 37):
+                    hour = 16 + (idx * 5) // 60
+                    minute = (idx * 5) % 60
+                    sched = f"2026-11-26T{hour:02d}:{minute:02d}:00+07:00"
+                    snap = f"snap_26_{idx:02d}"
+                    db.execute(
+                        "INSERT INTO slots(study, registry, scheduled, snapshot, status) VALUES (?, ?, ?, ?, ?)",
+                        ("hcm_urban_13paths", "main13_20261117_869a0f5a", sched, snap, "complete"),
+                    )
+                    for t_i in range(11):
+                        db.execute(
+                            "INSERT INTO attempts(scope, provider, snapshot, resource, number, reserved_at, outcome) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                            ("daily_13paths_implementation_v1", "traffic", snap, f"tile_{t_i}", 1, sched, "ok"),
+                        )
+
+            # 1. Ledger check detects partial 36/37 capture
+            is_dup, reason = check_duplicate_live_capture(
+                db_path,
+                target_date="2026-11-26",
+                mode="afternoon_37slots",
+                dry_run=False,
+            )
+            self.assertTrue(is_dup)
+            self.assertIn("captured_slots=36", reason)
+            self.assertIn("missed_slots=1", reason)
+            self.assertIn("traffic_attempts=396", reason)
+
+            # 2. Checkpoint archive check also detects Run #20 partial capture
+            chk_file = create_checkpoint(
+                db_path,
+                tmp_path / "chk",
+                {"study_id": "hcm_urban_13paths", "registry_version": "main13_20261117_869a0f5a", "run_id": "45788636369"},
+            )
+            is_dup_chk, _ = inspect_checkpoint_archive_for_duplicate(
+                chk_file, target_date="2026-11-26", mode="afternoon_37slots", dry_run=False
+            )
+            self.assertTrue(is_dup_chk)
+
+            # 3. GitHub API check detects Run #20 (conclusion='failure', 152MB artifact, Execute Capture Run='success')
+            def fake_gh(cmd, capture_output=True, text=True, timeout=30):
+                m = unittest.mock.MagicMock()
+                m.returncode = 0
+                joined = " ".join(cmd)
+                if "artifacts" in joined:
+                    m.stdout = json.dumps([
+                        {
+                            "name": "capture-outputs-afternoon_37slots-2026-11-26-run45788636369",
+                            "size_in_bytes": 152005006,
+                            "workflow_run": {"id": 45788636369},
+                        }
+                    ])
+                elif "/jobs" in joined:
+                    m.stdout = json.dumps([
+                        {
+                            "steps": [
+                                {
+                                    "name": "Execute Capture Run (Trial or Afternoon)",
+                                    "conclusion": "success",
+                                    "started_at": "2026-11-26T09:05:16Z",
+                                    "completed_at": "2026-11-26T12:00:17Z",
+                                }
+                            ]
+                        }
+                    ])
+                else:
+                    m.stdout = json.dumps({
+                        "id": 45788636369,
+                        "conclusion": "failure",
+                        "display_title": "Capture 13 Paths",
+                    })
+                return m
+
+            with unittest.mock.patch.dict(os.environ, {"GH_TOKEN": "mock-token"}), \
+                 unittest.mock.patch("subprocess.run", side_effect=fake_gh):
+                is_dup_gh, reason_gh = check_github_actions_for_duplicate(
+                    "kienhuynh22/HCM-Traffic",
+                    target_date="2026-11-26",
+                    mode="afternoon_37slots",
+                    dry_run=False,
+                    current_run_id="999999",
+                )
+            self.assertTrue(is_dup_gh)
+            self.assertIn("45788636369", reason_gh)
+            self.assertIn("failure", reason_gh)
+
+            # 4. Also verify smaller partial session (1 partial slot only, 0 complete) is detected
+            db_partial = tmp_path / "partial_1slot.sqlite"
+            s_partial = State(db_partial)
+            with s_partial.connect() as db:
+                db.execute(
+                    "INSERT INTO slots(study, registry, scheduled, snapshot, status) VALUES (?, ?, ?, ?, ?)",
+                    ("hcm_urban_13paths", "main13_20261117_869a0f5a", "2026-11-26T09:00:00+00:00", "snap_p1", "partial"),
+                )
+            is_dup_p, reason_p = check_duplicate_live_capture(
+                db_partial, target_date="2026-11-26", mode="afternoon_37slots", dry_run=False
+            )
+            self.assertTrue(is_dup_p)
+            self.assertIn("captured_slots=1", reason_p)
+
+    # --------------------------------------------------------------------------
+    # 19. Run #21 (2026-11-27 01:37 VN): Safe Checkpoint Restore With allow_init=False
+    # --------------------------------------------------------------------------
+    def test_19_run21_checkpoint_safe_restore_and_zero_capture_for_today(self):
+        from scripts.check_run_guard import check_duplicate_live_capture, check_github_actions_for_duplicate
+        from scripts.manage_state import create_checkpoint, restore_checkpoint, get_daily_provider_counts
+        from src.storage.state import State
+        import json
+        import os
+        import tempfile
+        import unittest.mock
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            db_path = tmp_path / "capture_run21.sqlite"
+            state = State(db_path)
+            # Only 2026-11-26 capture exists; 2026-11-27 (midnight timeout #21) recorded 0 slots / 0 attempts
+            with state.connect() as db:
+                db.execute(
+                    "INSERT INTO slots(study, registry, scheduled, snapshot, status) VALUES (?, ?, ?, ?, ?)",
+                    ("hcm_urban_13paths", "main13_20261117_869a0f5a", "2026-11-26T09:05:00+00:00", "snap_prev", "complete"),
+                )
+                db.execute(
+                    "INSERT INTO attempts(scope, provider, snapshot, resource, number, reserved_at, outcome) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    ("daily_13paths_implementation_v1", "traffic", "snap_prev", "tile_0", 1, "2026-11-26T09:05:00+00:00", "ok"),
+                )
+
+            expected = {"study_id": "hcm_urban_13paths", "registry_version": "main13_20261117_869a0f5a"}
+            chk_run21 = create_checkpoint(db_path, tmp_path / "chk21", {**expected, "run_id": "45877394268"})
+
+            # Next run restores Run #21's checkpoint with allow_init=False
+            restored_db = tmp_path / "next_run.sqlite"
+            restore_checkpoint(chk_run21, restored_db, expected_scope=expected, allow_init=False)
+            counts = get_daily_provider_counts(restored_db)
+            self.assertEqual(counts.get(("2026-11-26", "traffic"), 0), 1)
+            self.assertEqual(counts.get(("2026-11-27", "traffic"), 0), 0)
+
+            # Midnight Run #21 did NOT capture anything on 2026-11-27 -> afternoon run NOT blocked
+            is_dup, _ = check_duplicate_live_capture(
+                restored_db, target_date="2026-11-27", mode="afternoon_37slots", dry_run=False
+            )
+            self.assertFalse(is_dup)
+
+            # Remote API check also ignores Run #21 (cancelled at 05:37 ICT before 16:00 slot 1, 917KB)
+            def fake_gh_run21(cmd, capture_output=True, text=True, timeout=30):
+                m = unittest.mock.MagicMock()
+                m.returncode = 0
+                joined = " ".join(cmd)
+                if "artifacts" in joined:
+                    m.stdout = json.dumps([
+                        {
+                            "name": "capture-outputs-afternoon_37slots-2026-11-27-run45877394268",
+                            "size_in_bytes": 917955,
+                            "workflow_run": {"id": 45877394268},
+                        }
+                    ])
+                elif "/jobs" in joined:
+                    m.stdout = json.dumps([
+                        {
+                            "steps": [
+                                {
+                                    "name": "Execute Capture Run (Trial or Afternoon)",
+                                    "conclusion": "cancelled",
+                                    "started_at": "2026-11-26T18:37:52Z",
+                                    "completed_at": "2026-11-26T22:37:34Z",
+                                }
+                            ]
+                        }
+                    ])
+                else:
+                    m.stdout = json.dumps({
+                        "id": 45877394268,
+                        "conclusion": "cancelled",
+                        "display_title": "Capture 13 Paths",
+                    })
+                return m
+
+            with unittest.mock.patch.dict(os.environ, {"GH_TOKEN": "mock-token"}), \
+                 unittest.mock.patch("subprocess.run", side_effect=fake_gh_run21):
+                is_dup_gh, _ = check_github_actions_for_duplicate(
+                    "kienhuynh22/HCM-Traffic",
+                    target_date="2026-11-27",
+                    mode="afternoon_37slots",
+                    dry_run=False,
+                    current_run_id="999999",
+                )
+            self.assertFalse(is_dup_gh)
+
+    # --------------------------------------------------------------------------
+    # 20. Guard Scenario: Same-Day Trial (trial_3slots) & Dry-Run Do NOT Block Live
+    # --------------------------------------------------------------------------
+    def test_20_trial_and_dry_run_same_day_do_not_block_production(self):
+        from scripts.check_run_guard import check_duplicate_live_capture, check_github_actions_for_duplicate
+        from scripts.manage_state import import_external_usage
+        from src.storage.state import State
+        from datetime import date
+        import json
+        import os
+        import tempfile
+        import unittest.mock
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            db_path = Path(tmp_dir) / "capture.sqlite"
+            state = State(db_path)
+
+            # Simulate trial_3slots + external usage on the SAME day (2026-11-27)
+            import_external_usage(db_path, "local_trial_test", date(2026, 11, 27), 33, 39, allow_init=True)
+            with state.connect() as db:
+                for idx, sched in enumerate(["2026-11-27T04:00:00+00:00", "2026-11-27T04:05:00+00:00"]):
+                    snap = f"trial_snap_{idx}"
+                    db.execute(
+                        "INSERT INTO slots(study, registry, scheduled, snapshot, status) VALUES (?, ?, ?, ?, ?)",
+                        ("hcm_urban_trial_trial_2026-11-27_1100_1110_abc", "main13_20261117_869a0f5a", sched, snap, "complete"),
+                    )
+                    db.execute(
+                        "INSERT INTO attempts(scope, provider, snapshot, resource, number, reserved_at, outcome) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                        ("daily_13paths_implementation_v1", "traffic", snap, "tile_0", 1, sched, "ok"),
+                    )
+
+            # Production afternoon_37slots MUST NOT be blocked by same-day trial_3slots!
+            is_dup, reason = check_duplicate_live_capture(
+                db_path,
+                target_date="2026-11-27",
+                mode="afternoon_37slots",
+                dry_run=False,
+                study_id="hcm_urban_13paths",
+            )
+            self.assertFalse(is_dup)
+            self.assertIn("No prior production live capture found", reason)
+
+            # Remote GitHub API check ignores both dry-run (26KB / title) and trial_3slots artifacts
+            def fake_gh_dry_and_trial(cmd, capture_output=True, text=True, timeout=30):
+                m = unittest.mock.MagicMock()
+                m.returncode = 0
+                joined = " ".join(cmd)
+                if "artifacts" in joined:
+                    m.stdout = json.dumps([
+                        {
+                            "name": "capture-outputs-trial_3slots-2026-11-27-run101",
+                            "size_in_bytes": 12337528,
+                            "workflow_run": {"id": 101},
+                        },
+                        {
+                            "name": "capture-outputs-afternoon_37slots-2026-11-27-run102",
+                            "size_in_bytes": 26050,
+                            "workflow_run": {"id": 102},
+                        },
+                    ])
+                elif "/jobs" in joined:
+                    m.stdout = json.dumps([
+                        {
+                            "steps": [
+                                {
+                                    "name": "Execute Capture Run (Trial or Afternoon)",
+                                    "conclusion": "success",
+                                    "started_at": "2026-11-27T08:15:38Z",
+                                    "completed_at": "2026-11-27T08:15:40Z",
+                                }
+                            ]
+                        }
+                    ])
+                else:
+                    m.stdout = json.dumps({
+                        "id": 102,
+                        "conclusion": "success",
+                        "display_title": "Capture 13 Paths [afternoon_37slots dry-run 2026-11-27]",
+                    })
+                return m
+
+            with unittest.mock.patch.dict(os.environ, {"GH_TOKEN": "mock-token"}), \
+                 unittest.mock.patch("subprocess.run", side_effect=fake_gh_dry_and_trial):
+                is_dup_gh, _ = check_github_actions_for_duplicate(
+                    "kienhuynh22/HCM-Traffic",
+                    target_date="2026-11-27",
+                    mode="afternoon_37slots",
+                    dry_run=False,
+                    current_run_id="999999",
+                )
+            self.assertFalse(is_dup_gh)
+
+    # --------------------------------------------------------------------------
+    # 21. Cloudflare Worker Cron Config, Input Contract & Two Close Triggers
+    # --------------------------------------------------------------------------
+    def test_21_worker_config_inputs_contract_and_close_triggers(self):
+        import re
+        import tomllib
+        import yaml
+        from datetime import datetime
+        from zoneinfo import ZoneInfo
+        from scripts.check_run_guard import check_startup_window, check_duplicate_live_capture
+        from src.storage.state import State
+        import tempfile
+
+        # 1. Verify wrangler.toml crons at 15:35 and 15:45 Asia/Ho_Chi_Minh (08:35 and 08:45 UTC)
+        wrangler_path = Path("cloudflare_worker/wrangler.toml")
+        self.assertTrue(wrangler_path.is_file())
+        with open(wrangler_path, "rb") as f:
+            wrangler_cfg = tomllib.load(f)
+        crons = wrangler_cfg.get("triggers", {}).get("crons", [])
+        self.assertEqual(crons, ["35 8 * * *", "45 8 * * *"])
+
+        # 2. Verify Worker dispatch inputs match capture_13paths.yml workflow_dispatch inputs
+        with open(".github/workflows/capture_13paths.yml", "r", encoding="utf-8") as f:
+            wf = yaml.safe_load(f)
+        triggers = wf.get("on") or wf.get(True) or {}
+        wf_inputs = triggers["workflow_dispatch"]["inputs"]
+
+        worker_js = Path("cloudflare_worker/src/index.js").read_text(encoding="utf-8")
+        # Extract keys inside dispatchPayload inputs block
+        m_inputs = re.search(r"inputs:\s*\{(.*?)\n\s*\}", worker_js, re.S)
+        self.assertIsNotNone(m_inputs)
+        worker_inputs_block = m_inputs.group(1)
+        sent_keys = re.findall(r"^\s*([a-zA-Z0-9_]+)\s*:", worker_inputs_block, re.M)
+        self.assertTrue(sent_keys)
+        for k in sent_keys:
+            self.assertIn(k, wf_inputs, f"Worker sends unknown input '{k}' not in capture_13paths.yml")
+        for required_k in ("mode", "dry_run", "allow_init_state", "date", "automated", "import_external_source"):
+            self.assertIn(required_k, sent_keys)
+
+        # Ensure booleans/numbers in /dispatches payload are strings ("false", "true", "0")
+        self.assertIn('mode: "afternoon_37slots"', worker_js)
+        self.assertIn('dry_run: "false"', worker_js)
+        self.assertIn('allow_init_state: "false"', worker_js)
+        self.assertIn('automated: "true"', worker_js)
+        self.assertIn('import_external_source: ""', worker_js)
+        self.assertIn('import_traffic: "0"', worker_js)
+        self.assertIn('import_weather: "0"', worker_js)
+
+        # Ensure Summary line handles empty geometry_coverage without ValueError (Run #20 fix)
+        wf_text = Path(".github/workflows/capture_13paths.yml").read_text(encoding="utf-8")
+        self.assertIn("float(r.get('geometry_coverage') or 0)", wf_text)
+
+        # 3. Simulate two close triggers (15:35 then 15:45 / queued after 15:35 finishes)
+        tz = ZoneInfo("Asia/Ho_Chi_Minh")
+        dt_1535 = datetime(2026, 11, 27, 15, 35, 0, tzinfo=tz)
+        dt_1545 = datetime(2026, 11, 27, 15, 45, 0, tzinfo=tz)
+        dt_1901 = datetime(2026, 11, 27, 19, 1, 0, tzinfo=tz)
+
+        ok_1, _ = check_startup_window("workflow_dispatch", "afternoon_37slots", True, now_dt=dt_1535)
+        self.assertTrue(ok_1)
+        ok_2_same_win, _ = check_startup_window("schedule", "afternoon_37slots", True, now_dt=dt_1545)
+        self.assertTrue(ok_2_same_win)
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            db_path = Path(tmp_dir) / "capture.sqlite"
+            st = State(db_path)
+            with st.connect() as db:
+                db.execute(
+                    "INSERT INTO slots(study, registry, scheduled, snapshot, status) VALUES (?, ?, ?, ?, ?)",
+                    ("hcm_urban_13paths", "main13_20261117_869a0f5a", "2026-11-27T09:00:00+00:00", "snap_t1", "complete"),
+                )
+            # Even if Trigger 2 somehow started inside [15:30, 16:00), duplicate guard stops it
+            is_dup_2, _ = check_duplicate_live_capture(db_path, "2026-11-27", "afternoon_37slots", False)
+            self.assertTrue(is_dup_2)
+            # If Trigger 2 waited in concurrency queue until Trigger 1 finished at 19:01, window guard ALSO stops it
+            ok_late, _ = check_startup_window("schedule", "afternoon_37slots", True, now_dt=dt_1901)
+            self.assertFalse(ok_late)
 
 
 if __name__ == "__main__":

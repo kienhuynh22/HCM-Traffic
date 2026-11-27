@@ -1,4 +1,6 @@
 name: Capture 13 Paths
+run-name: >-
+  ${{ github.event_name == 'schedule' && 'Capture 13 Paths [afternoon_37slots live]' || format('Capture 13 Paths [{0} {1} {2}]', inputs.mode, inputs.dry_run && 'dry-run' || 'live', inputs.date || 'auto-vn') }}
 
 on:
   workflow_dispatch:
@@ -345,6 +347,7 @@ jobs:
             --mode "$MODE" \
             $DRY_RUN_ARG \
             $CHK_ARG \
+            --study-id "hcm_urban_13paths" \
             --repo "$REPO" \
             --current-run-id "$CURRENT_RUN_ID"; then
             SKIP_REASON="Production live capture for $DATE already completed by prior run."
@@ -606,7 +609,8 @@ jobs:
                       lines.append("\n| Segment ID | Road Name | Dir | Slot | Speed (km/h) | CI | Geom Cov |")
                       lines.append("| :--- | :--- | :---: | :---: | :---: | :---: | :---: |")
                       for r in day_rows[:13]:
-                          lines.append(f"| `{r.get('segment_id')}` | {r.get('road_name')} | {r.get('direction_id')} | {r.get('time_slot')} | {r.get('current_speed_kmh')} | {r.get('ci')} | {float(r.get('geometry_coverage', 0)):.4f} |")
+                          geom_cov = float(r.get('geometry_coverage') or 0)
+                          lines.append(f"| `{r.get('segment_id')}` | {r.get('road_name')} | {r.get('direction_id')} | {r.get('time_slot')} | {r.get('current_speed_kmh')} | {r.get('ci')} | {geom_cov:.4f} |")
 
           if not found_data and not skip_run:
               lines.append("> [!INFO]\n> No observations published. (Normal for dry-run or preflight aborts). Check step logs for diagnostic preflight results.")

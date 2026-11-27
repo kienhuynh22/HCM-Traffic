@@ -1,36 +1,36 @@
 # Cloudflare Worker Scheduler Guard for HCM-Traffic
 
-Independent cron monitor deployed on Cloudflare Workers to guarantee that the `afternoon_37slots` capture session launches on time every day (~15:45 Vietnam time / 08:45 UTC), while preventing any duplicate runs.
+Independent cron monitor deployed on Cloudflare Workers to guarantee that the `afternoon_37slots` capture session launches early enough for the 16:00 Vietnam milestone every day (triggering at **15:35** and **15:45** Vietnam time / `08:35` & `08:45` UTC), while preventing any duplicate runs.
 
 ---
 
 ## 1. How It Works
 
-1. **Trigger Time:**
-   - Triggers every day at `08:45 UTC` (`15:45 Asia/Ho_Chi_Minh`), exactly 15 minutes before the first afternoon slot (16:00).
-   - Serves as an independent fallback in case GitHub Actions native cron (`08:40 UTC` / `15:40 ICT`) experiences scheduling delay, server jitter, or drops.
-2. **Duplicate Prevention Check:**
+1. **Trigger Times (`wrangler.toml`):**
+   - Triggers daily at `08:35 UTC` (**15:35 ICT**) and `08:45 UTC` (**15:45 ICT**), well inside the `[15:30, 16:00)` startup window before slot 1 at `16:00`.
+   - At `15:35`, if no production live run is active or already captured today, it dispatches `capture_13paths.yml`.
+   - At `15:45`, it checks again; if the `15:35` dispatch or GitHub cron (`15:40`) is already queued/running, it skips dispatch. If `15:35` failed or was skipped, `15:45` acts as a second safety net.
+2. **Duplicate & Partial-Capture Prevention Check:**
    - Queries GitHub Actions API for `capture_13paths.yml` workflow runs.
-   - **Active Run:** If any run is currently `queued`, `in_progress`, or `waiting`, it **skips dispatch**.
-   - **Completed Run:** If a production live session has already succeeded for today (`date` in Vietnam time with full artifact), it **skips dispatch**.
-   - **Dry-run & Trial Distinction:** Ignores dry-runs or trials (does not treat them as production capture).
-3. **Dispatch:**
-   - If and only if NO production run exists or is running for today, it sends a `POST /dispatches` request to GitHub Actions with:
-     - `ref`: `master`
-     - `mode`: `afternoon_37slots`
-     - `dry_run`: `false`
-     - `allow_init_state`: `false`
-     - `date`: `<current_date_in_vietnam>` (YYYY-MM-DD)
-     - `automated`: `true`
+   - **Active Run:** If a production live run for today is `queued`, `in_progress`, or `waiting`, it **skips dispatch**. Active `dry-run` or `trial_3slots` runs do not suppress production dispatch.
+   - **Completed or Partial Capture (including `conclusion == 'failure'` like Run #20):** Inspects recent completed runs regardless of conclusion. If a run captured production slots for today (`afternoon_37slots` bundle >= 2 MB or capture step ran past 16:00 ICT for >= 120s), it **skips dispatch** so partial sessions (e.g., 36/37 slots) are never re-captured in full.
+   - **Distinction:** Ignores `dry-run`, `trial_3slots`, early-halted runs, and 0-slot midnight timeout runs (e.g. Run #10, #21).
+3. **Dispatch (`POST /dispatches`):**
+   - If and only if no active or captured production live run exists for today, it sends `POST /dispatches` on `master` with explicit string inputs matching `capture_13paths.yml`:
+     - `mode`: `"afternoon_37slots"`
+     - `dry_run`: `"false"`
+     - `allow_init_state`: `"false"`
+     - `date`: `"<YYYY-MM-DD>"` (Vietnam time)
+     - `automated`: `"true"`
      - `import_external_source`: `""`
+     - `import_traffic`: `"0"`
+     - `import_weather`: `"0"`
 4. **Fail-Safe Invariant:**
-   - If the GitHub API cannot be reached or returns an HTTP error, the Worker **throws an error and halts**. It never executes a blind dispatch when repository status is unknown.
+   - If the GitHub API cannot be reached or returns a non-OK HTTP status, the Worker **throws an error and marks the execution failed**. It never executes a blind dispatch when repository status is unknown.
 
 ---
 
 ## 2. Minimal Required Permissions (Least-Privilege)
-
-To allow the Worker to inspect runs and dispatch the workflow without giving access to sensitive repository data or administrative settings:
 
 Create a **Fine-grained Personal Access Token (PAT)** in GitHub:
 1. Go to **GitHub Settings** -> **Developer Settings** -> **Personal Access Tokens** -> **Fine-grained tokens** -> **Generate new token**.
@@ -40,10 +40,10 @@ Create a **Fine-grained Personal Access Token (PAT)** in GitHub:
 5. **Repository Access:** **Only select repositories** -> Select `kienhuynh22/HCM-Traffic`.
 6. **Repository Permissions:**
    - **Actions:** `Read and write`
-     - *Read* is required to query workflow runs and artifacts (`GET /repos/{owner}/{repo}/actions/...`).
-     - *Write* is required to trigger workflow dispatches (`POST /repos/{owner}/{repo}/actions/workflows/.../dispatches`).
+     - *Read* is required to query workflow runs, jobs, and artifacts.
+     - *Write* is required to trigger workflow dispatches (`POST /dispatches`).
    - **Metadata:** `Read-only` (automatically included by GitHub).
-   - **All other permissions:** `No access` (do **NOT** grant access to Secrets, Administration, Contents write, Pull Requests, or Issues).
+   - **All other permissions:** `No access`.
 
 ---
 
@@ -51,40 +51,36 @@ Create a **Fine-grained Personal Access Token (PAT)** in GitHub:
 
 The Worker requires one secret: `GITHUB_TOKEN`.
 
-### Option A: Via Cloudflare Dashboard (Recommended)
+### Option A: Via Cloudflare Dashboard
 1. Log in to [Cloudflare Dashboard](https://dash.cloudflare.com/).
-2. Navigate to **Workers & Pages** -> Click on `hcm-traffic-scheduler-guard` (after deploying).
+2. Navigate to **Workers & Pages** -> Select `hcm-traffic-scheduler-guard`.
 3. Go to **Settings** -> **Variables and Secrets**.
 4. Under **Secrets**, click **Add**:
    - **Variable name:** `GITHUB_TOKEN`
-   - **Value:** Paste the fine-grained PAT generated in step 2.
+   - **Value:** Paste the fine-grained PAT.
    - Click **Save and deploy**.
 
 ### Option B: Via Wrangler CLI
-Run the following command from the `cloudflare_worker` directory:
 ```bash
+cd cloudflare_worker
 npx wrangler secret put GITHUB_TOKEN
-# Paste your GitHub fine-grained PAT when prompted
 ```
 
 ---
 
 ## 4. Local Testing and Deployment
 
-### Test Locally
 ```bash
 cd cloudflare_worker
 npm install
-# Set temporary secret in .dev.vars for local testing:
 echo "GITHUB_TOKEN=your_pat_token_here" > .dev.vars
 npm run dev
+# Test endpoints:
+# GET http://localhost:8787/status
+# GET http://localhost:8787/check
 ```
-In your browser or curl:
-- `http://localhost:8787/status` -> Check current time in Vietnam and target date.
-- `http://localhost:8787/trigger` -> Simulate check & dispatch logic.
 
-### Deploy to Cloudflare
+Deploy when approved:
 ```bash
 npm run deploy
 ```
-Once deployed, Cloudflare will trigger the worker automatically according to `crons = ["45 8 * * *"]`.

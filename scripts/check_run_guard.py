@@ -61,14 +61,18 @@ def check_duplicate_live_capture(
     mode: str,
     dry_run: bool,
     tz_str: str = "Asia/Ho_Chi_Minh",
+    study_id: str = "hcm_urban_13paths",
 ) -> tuple[bool, str]:
     """
-    Checks if a production live run for target_date has already completed in the ledger.
+    Checks if a production live run for target_date has already captured (fully or partially)
+    in the state ledger.
     Distinguishes:
-    - Production live capture: recorded attempts > 0 and/or completed slots on target_date.
-    - Dry-run: 0 attempts recorded.
-    - Trial: different mode / pilot root.
-    - Runs stopped before capture (like #10): 0 attempts recorded on target_date.
+    - Production live capture (even partial, e.g. 36/37 slots in Run #20 or 1/37):
+      slots with study == study_id and status in ('complete', 'partial', 'interrupted', 'collecting')
+      on target_date, or attempts linked to those production slots.
+    - Dry-run: 0 slots and 0 attempts recorded.
+    - Trial (trial_3slots): slots have study starting with 'hcm_urban_trial_', NOT study_id.
+    - Runs stopped before capture (like #10 or #21): 0 slots and 0 attempts recorded on target_date.
 
     Returns (is_duplicate: bool, reason: str).
     If is_duplicate is True, the run should halt early to prevent duplicate capture.
@@ -80,44 +84,78 @@ def check_duplicate_live_capture(
         return False, "No state database found; duplicate check passes."
 
     db_file = Path(db_path).resolve()
-    counts = get_daily_provider_counts(db_file, accounting_tz=tz_str)
-    traffic_attempts = counts.get((target_date, "traffic"), 0)
-    weather_attempts = counts.get((target_date, "weather"), 0)
+    zone = ZoneInfo(tz_str)
+    captured_slots = 0
+    missed_slots = 0
+    prod_snapshots: set[str] = set()
+    prod_attempts = 0
+    prod_traffic_attempts = 0
+    prod_weather_attempts = 0
 
-    # Check slots table for completed slots on target_date
-    completed_slots = 0
+    conn = sqlite3.connect(str(db_file), timeout=10)
     try:
-        conn = sqlite3.connect(str(db_file), timeout=10)
-        try:
-            cur = conn.cursor()
-            cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='slots'")
-            if cur.fetchone():
-                cur.execute("SELECT scheduled, status FROM slots WHERE status='complete'")
-                zone = ZoneInfo(tz_str)
-                for res_sched, status in cur.fetchall():
-                    try:
-                        clean_ts = str(res_sched).replace("Z", "+00:00")
-                        dt = datetime.fromisoformat(clean_ts)
-                        if dt.tzinfo is None:
-                            dt = dt.replace(tzinfo=timezone.utc)
-                        local_d = dt.astimezone(zone).date().isoformat()
-                        if local_d == target_date:
-                            completed_slots += 1
-                    except Exception:
-                        continue
-        finally:
-            conn.close()
-    except Exception:
-        pass
+        cur = conn.cursor()
+        cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='slots'")
+        if cur.fetchone():
+            cur.execute(
+                "SELECT scheduled, snapshot, status FROM slots WHERE study=?",
+                (study_id,),
+            )
+            for res_sched, snap_id, status in cur.fetchall():
+                try:
+                    clean_ts = str(res_sched).replace("Z", "+00:00")
+                    dt = datetime.fromisoformat(clean_ts)
+                    if dt.tzinfo is None:
+                        dt = dt.replace(tzinfo=timezone.utc)
+                    local_d = dt.astimezone(zone).date().isoformat()
+                    if local_d == target_date:
+                        if snap_id:
+                            prod_snapshots.add(str(snap_id))
+                        if status in ("complete", "partial", "interrupted", "collecting"):
+                            captured_slots += 1
+                        elif status == "missed":
+                            missed_slots += 1
+                except Exception:
+                    continue
 
-    if traffic_attempts > 0 or completed_slots > 0:
+        cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='attempts'")
+        if cur.fetchone() and prod_snapshots:
+            placeholders = ",".join("?" for _ in prod_snapshots)
+            cur.execute(
+                f"SELECT provider, reserved_at FROM attempts WHERE snapshot IN ({placeholders})",
+                tuple(prod_snapshots),
+            )
+            for prov, res_at in cur.fetchall():
+                try:
+                    clean_ts = str(res_at).replace("Z", "+00:00")
+                    if " " in clean_ts and "T" not in clean_ts:
+                        clean_ts = clean_ts.replace(" ", "T")
+                    dt = datetime.fromisoformat(clean_ts)
+                    if dt.tzinfo is None:
+                        dt = dt.replace(tzinfo=timezone.utc)
+                    local_d = dt.astimezone(zone).date().isoformat()
+                    if local_d == target_date:
+                        prod_attempts += 1
+                        if prov == "traffic":
+                            prod_traffic_attempts += 1
+                        elif prov == "weather":
+                            prod_weather_attempts += 1
+                except Exception:
+                    continue
+    finally:
+        conn.close()
+
+    if captured_slots > 0 or prod_attempts > 0:
         return True, (
-            f"Production live capture for {target_date} already completed in state ledger "
-            f"(traffic_attempts={traffic_attempts}, weather_attempts={weather_attempts}, "
-            f"completed_slots={completed_slots})."
+            f"Production live capture for {target_date} (study={study_id}) already occurred in state ledger "
+            f"(captured_slots={captured_slots}, missed_slots={missed_slots}, "
+            f"traffic_attempts={prod_traffic_attempts}, weather_attempts={prod_weather_attempts})."
         )
 
-    return False, f"No prior live capture found in ledger for {target_date} (traffic={traffic_attempts}, slots={completed_slots})."
+    return False, (
+        f"No prior production live capture found in ledger for {target_date} "
+        f"(study={study_id}, captured_slots={captured_slots}, prod_attempts={prod_attempts})."
+    )
 
 
 def inspect_checkpoint_archive_for_duplicate(
@@ -126,6 +164,7 @@ def inspect_checkpoint_archive_for_duplicate(
     mode: str,
     dry_run: bool,
     tz_str: str = "Asia/Ho_Chi_Minh",
+    study_id: str = "hcm_urban_13paths",
 ) -> tuple[bool, str]:
     """
     Extracts sqlite db from checkpoint tar archive to a temporary directory
@@ -146,7 +185,9 @@ def inspect_checkpoint_archive_for_duplicate(
                     tar.extract(member, path=tmp_path)
                     db_candidate = tmp_path / member.name
                     if db_candidate.is_file():
-                        return check_duplicate_live_capture(db_candidate, target_date, mode, dry_run, tz_str)
+                        return check_duplicate_live_capture(
+                            db_candidate, target_date, mode, dry_run, tz_str, study_id=study_id
+                        )
 
     return False, "No sqlite file found inside checkpoint archive."
 
@@ -159,9 +200,9 @@ def check_github_actions_for_duplicate(
     current_run_id: str = "",
 ) -> tuple[bool, str]:
     """
-    Inspects GitHub Actions API for existing runs on target_date:
-    1. Checks if another run is currently queued or in_progress.
-    2. Checks if an earlier run completed successfully with production artifact for target_date.
+    Inspects GitHub Actions API for existing production live runs on target_date.
+    Distinguishes full/partial production captures (even if GitHub conclusion == 'failure'
+    like Run #20 with 36/37 slots) from dry-runs, trials, and runs stopped before capture (#10, #21).
     """
     if mode != "afternoon_37slots" or dry_run:
         return False, f"Duplicate check not applicable for mode='{mode}', dry_run={dry_run}."
@@ -170,46 +211,67 @@ def check_github_actions_for_duplicate(
     if not token or not repo:
         return False, "GitHub token or repository missing; skipping remote API duplicate check."
 
-    cmd = [
-        "gh", "run", "list",
-        "--repo", repo,
-        "--workflow", "capture_13paths.yml",
-        "--limit", "15",
-        "--json", "databaseId,status,conclusion,createdAt"
-    ]
-    try:
-        res = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
-        if res.returncode != 0:
-            return False, f"Failed to query GitHub CLI: {res.stderr.strip()}"
-        runs = json.loads(res.stdout)
-    except Exception as exc:
-        return False, f"Error inspecting GitHub runs: {exc}"
-
     current_id_str = str(current_run_id).strip()
     target_artifact_prefix = f"capture-outputs-{mode}-{target_date}-"
+    zone = ZoneInfo("Asia/Ho_Chi_Minh")
+    slot1_utc = datetime.fromisoformat(f"{target_date}T16:00:00+07:00").astimezone(timezone.utc)
 
-    # Query artifacts to see if a successful production artifact exists for target_date
-    art_cmd = ["gh", "api", f"repos/{repo}/actions/artifacts", "--jq", ".artifacts"]
+    art_cmd = ["gh", "api", f"repos/{repo}/actions/artifacts?per_page=100", "--jq", ".artifacts"]
     try:
         art_res = subprocess.run(art_cmd, capture_output=True, text=True, timeout=30)
-        if art_res.returncode == 0:
-            artifacts = json.loads(art_res.stdout)
-            for art in artifacts:
-                art_name = art.get("name", "")
-                run_id = str(art.get("workflow_run", {}).get("id", ""))
-                size = art.get("size_in_bytes", 0)
-                if run_id == current_id_str:
-                    continue
-                # Production complete runs are ~150MB, dry runs are ~26KB, timeout runs are ~272KB
-                if art_name.startswith(target_artifact_prefix) and size > 1_000_000:
-                    return True, (
-                        f"Found completed production run artifact '{art_name}' (size={size} bytes, "
-                        f"run_id={run_id}) for {target_date}."
-                    )
-    except Exception:
-        pass
+        if art_res.returncode != 0:
+            return False, f"Failed to query GitHub artifacts: {art_res.stderr.strip()}"
+        artifacts = json.loads(art_res.stdout)
+        for art in artifacts:
+            art_name = art.get("name", "")
+            run_id = str(art.get("workflow_run", {}).get("id", ""))
+            size = art.get("size_in_bytes", 0)
+            if run_id == current_id_str or not art_name.startswith(target_artifact_prefix):
+                continue
 
-    return False, f"No remote production live run found for {target_date}."
+            # Verify run metadata and job steps so we don't confuse dry-runs or 0-slot timeouts
+            run_cmd = ["gh", "api", f"repos/{repo}/actions/runs/{run_id}"]
+            jobs_cmd = ["gh", "api", f"repos/{repo}/actions/runs/{run_id}/jobs", "--jq", ".jobs"]
+            r_res = subprocess.run(run_cmd, capture_output=True, text=True, timeout=30)
+            j_res = subprocess.run(jobs_cmd, capture_output=True, text=True, timeout=30)
+            if r_res.returncode != 0 or j_res.returncode != 0:
+                continue
+
+            run_info = json.loads(r_res.stdout)
+            title = str(run_info.get("display_title", ""))
+            if "dry-run" in title or "[trial_3slots" in title:
+                continue
+
+            jobs = json.loads(j_res.stdout)
+            for job in jobs:
+                for step in job.get("steps", []):
+                    if step.get("name") == "Execute Capture Run (Trial or Afternoon)":
+                        conc = step.get("conclusion")
+                        comp_at = step.get("completed_at")
+                        start_at = step.get("started_at")
+                        comp_dt = datetime.fromisoformat(comp_at.replace("Z", "+00:00")) if comp_at else None
+                        start_dt = datetime.fromisoformat(start_at.replace("Z", "+00:00")) if start_at else None
+                        dur_s = (comp_dt - start_dt).total_seconds() if (comp_dt and start_dt) else 0
+
+                        if conc == "skipped":
+                            continue
+                        if conc == "cancelled" and comp_dt and comp_dt < slot1_utc:
+                            # Timed out before 16:00 VN slot 1 (like #10 and #21) -> 0 slots captured
+                            continue
+                        if conc == "success" and (size >= 2_000_000 or (comp_dt and comp_dt >= slot1_utc and dur_s >= 120)):
+                            return True, (
+                                f"Found completed/partial production run artifact '{art_name}' "
+                                f"(run_id={run_id}, run_conclusion={run_info.get('conclusion')}, size={size} bytes)."
+                            )
+                        if conc == "cancelled" and comp_dt and comp_dt >= slot1_utc and size >= 2_000_000:
+                            return True, (
+                                f"Found partial afternoon production run artifact '{art_name}' "
+                                f"(run_id={run_id}, size={size} bytes, cancelled after 16:00 ICT)."
+                            )
+    except Exception as exc:
+        return False, f"Error inspecting GitHub artifacts/runs: {exc}"
+
+    return False, f"No remote production live capture found for {target_date}."
 
 
 def main():
@@ -233,6 +295,7 @@ def main():
     dup_parser.add_argument("--repo", default="")
     dup_parser.add_argument("--current-run-id", default="")
     dup_parser.add_argument("--timezone", default="Asia/Ho_Chi_Minh")
+    dup_parser.add_argument("--study-id", default="hcm_urban_13paths")
 
     args = parser.parse_args()
 
@@ -260,6 +323,7 @@ def main():
                 args.mode,
                 args.dry_run,
                 tz_str=args.timezone,
+                study_id=args.study_id,
             )
 
         # Check 2: Direct DB path if provided and not yet duplicate
@@ -270,6 +334,7 @@ def main():
                 args.mode,
                 args.dry_run,
                 tz_str=args.timezone,
+                study_id=args.study_id,
             )
 
         # Check 3: GitHub API if repo provided and not yet duplicate

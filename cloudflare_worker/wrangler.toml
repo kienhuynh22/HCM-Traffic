@@ -3,7 +3,8 @@ main = "src/index.js"
 compatibility_date = "2024-11-01"
 
 [triggers]
-crons = ["45 8 * * *"] # 08:45 UTC = 15:45 Asia/Ho_Chi_Minh daily
+# 08:35 UTC = 15:35 Asia/Ho_Chi_Minh, 08:45 UTC = 15:45 Asia/Ho_Chi_Minh daily
+crons = ["35 8 * * *", "45 8 * * *"]
 
 [vars]
 GITHUB_REPO = "kienhuynh22/HCM-Traffic"
