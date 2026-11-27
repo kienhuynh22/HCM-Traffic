@@ -257,7 +257,7 @@ export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
 
-    if (url.pathname === "/status") {
+    if (request.method === "GET" && url.pathname === "/status") {
       const todayVN = getVietnamDateStr();
       const timeVN = getVietnamTimeStr();
       return new Response(
@@ -281,23 +281,9 @@ export default {
       );
     }
 
-    if (url.pathname === "/check" || url.pathname === "/trigger") {
-      try {
-        const result = await checkAndDispatch(env);
-        return new Response(JSON.stringify({ success: true, result }, null, 2), {
-          headers: { "Content-Type": "application/json" },
-        });
-      } catch (err) {
-        return new Response(JSON.stringify({ success: false, error: err.message }, null, 2), {
-          status: 500,
-          headers: { "Content-Type": "application/json" },
-        });
-      }
-    }
-
     return new Response(
-      "HCM-Traffic Cloudflare Worker Scheduler Guard. Use /status or /check.",
-      { headers: { "Content-Type": "text/plain" } }
+      "Not Found. Dispatches run exclusively via Cloudflare Cron Triggers. Use GET /status for read-only metadata.",
+      { status: 404, headers: { "Content-Type": "text/plain" } }
     );
   },
 };

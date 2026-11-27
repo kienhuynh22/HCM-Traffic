@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import {
+import worker, {
   ACTIVE_RUN_STATUSES,
   getVietnamDateStr,
   isActiveProductionLiveRun,
@@ -228,5 +228,40 @@ test("Manual session queued/pending/in_progress suppresses both 15:35 and 15:45 
         `Expected status=${status} title=${title} to be recognized as active production live run`
       );
     }
+  }
+});
+
+test("HTTP requests to /check and /trigger return 404 and never call GitHub API", async () => {
+  const originalFetch = globalThis.fetch;
+  let githubCalls = 0;
+  globalThis.fetch = async (url) => {
+    githubCalls += 1;
+    throw new Error(`Unexpected outbound fetch to ${url}`);
+  };
+
+  try {
+    for (const [method, path] of [
+      ["GET", "/check"],
+      ["POST", "/check"],
+      ["GET", "/trigger"],
+      ["POST", "/trigger"],
+    ]) {
+      const req = new Request(`https://example.workers.dev${path}`, { method });
+      const res = await worker.fetch(req, ENV, {});
+      assert.equal(res.status, 404, `Expected 404 for ${method} ${path}`);
+    }
+
+    // Read-only GET /status succeeds without making any outbound GitHub calls
+    const statusRes = await worker.fetch(new Request("https://example.workers.dev/status"), ENV, {});
+    assert.equal(statusRes.status, 200);
+    const body = await statusRes.json();
+    assert.equal(body.status, "ok");
+    assert.deepEqual(body.cron_schedules, [
+      "35 8 * * * (15:35 Asia/Ho_Chi_Minh)",
+      "45 8 * * * (15:45 Asia/Ho_Chi_Minh)",
+    ]);
+    assert.equal(githubCalls, 0);
+  } finally {
+    globalThis.fetch = originalFetch;
   }
 });

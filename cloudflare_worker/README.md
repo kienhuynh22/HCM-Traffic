@@ -76,9 +76,11 @@ npm test
 npm install
 echo "GITHUB_TOKEN=your_pat_token_here" > .dev.vars
 npm run dev
-# Test endpoints:
+# Read-only status endpoint (HTTP dispatch endpoints are disabled):
 # GET http://localhost:8787/status
-# GET http://localhost:8787/check
+# To test the scheduled cron handler locally with Wrangler:
+# npx wrangler dev --test-scheduled
+# curl "http://localhost:8787/__scheduled?cron=35+8+*+*+*"
 ```
 
 Deploy **only after merging PR #5 into `master`** (so `capture_13paths.yml` on `master` accepts the `automated` input):

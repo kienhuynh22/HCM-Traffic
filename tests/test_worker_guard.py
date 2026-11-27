@@ -316,6 +316,24 @@ class TestCloudflareWorkerGuardContract(unittest.TestCase):
                     f"Failed to detect active run for status={status}, title={title}",
                 )
 
+    def test_06_http_fetch_is_read_only_and_disables_check_and_trigger(self):
+        # Extract the fetch(...) handler body from index.js
+        m_fetch = re.search(r"async fetch\s*\([^)]*\)\s*\{(.*)\}\s*;\s*$", self.worker_js, re.S)
+        self.assertIsNotNone(m_fetch, "Could not locate fetch handler in cloudflare_worker/src/index.js")
+        fetch_body = m_fetch.group(1)
+
+        # /check and /trigger must be completely removed and fetch must never call checkAndDispatch
+        self.assertNotIn("/check", fetch_body)
+        self.assertNotIn("/trigger", fetch_body)
+        self.assertNotIn("checkAndDispatch", fetch_body)
+        self.assertIn("/status", fetch_body)
+        self.assertIn("status: 404", fetch_body)
+
+        # scheduled() handler must remain wired to checkAndDispatch
+        m_sched = re.search(r"async scheduled\s*\([^)]*\)\s*\{(.*?)async fetch", self.worker_js, re.S)
+        self.assertIsNotNone(m_sched)
+        self.assertIn("checkAndDispatch", m_sched.group(1))
+
 
 if __name__ == "__main__":
     unittest.main()
