@@ -1,4 +1,6 @@
 name: Capture 13 Paths
+run-name: >-
+  ${{ github.event_name == 'schedule' && 'Capture 13 Paths [afternoon_37slots live]' || format('Capture 13 Paths [{0} {1} {2}]', inputs.mode, format('{0}', inputs.dry_run) == 'true' && 'dry-run' || 'live', inputs.date || 'auto-vn') }}
 
 on:
   workflow_dispatch:
@@ -46,6 +48,11 @@ on:
         required: false
         type: number
         default: 0
+      automated:
+        description: 'Mark run as automated (enforces 15:30-16:00 VN startup window)'
+        required: false
+        type: boolean
+        default: false
 
   # Daily scheduled pilot run for afternoon window: 16:00 - 19:00 VN (37 slots, 5-minute intervals).
   # 08:40 UTC = 15:40 Asia/Ho_Chi_Minh (provides 20-minute margin for runner spinup,
@@ -118,6 +125,7 @@ jobs:
           INPUT_MODE: ${{ inputs.mode }}
           INPUT_DRY_RUN: ${{ inputs.dry_run }}
           INPUT_ALLOW_INIT: ${{ inputs.allow_init_state }}
+          INPUT_AUTOMATED: ${{ inputs.automated }}
           EVENT_NAME: ${{ github.event_name }}
         run: |
           # Resolve canonical state path directly from the configuration
@@ -143,6 +151,7 @@ jobs:
             RUN_MODE="afternoon_37slots"
             IS_DRY_RUN="false"
             ALLOW_INIT="false"
+            IS_AUTOMATED="true"
           else
             case "$INPUT_MODE" in
               trial_3slots|afternoon_37slots) RUN_MODE="$INPUT_MODE" ;;
@@ -150,12 +159,30 @@ jobs:
             esac
             IS_DRY_RUN="${INPUT_DRY_RUN:-true}"
             ALLOW_INIT="${INPUT_ALLOW_INIT:-false}"
+            IS_AUTOMATED="${INPUT_AUTOMATED:-false}"
           fi
           echo "mode=$RUN_MODE" >> $GITHUB_OUTPUT
           echo "dry_run=$IS_DRY_RUN" >> $GITHUB_OUTPUT
           echo "allow_init=$ALLOW_INIT" >> $GITHUB_OUTPUT
+          echo "is_automated=$IS_AUTOMATED" >> $GITHUB_OUTPUT
+
+          # Guard 1: Enforce launch window [15:30, 16:00) ICT for automated afternoon runs
+          AUTOMATED_ARG=""
+          if [ "$IS_AUTOMATED" = "true" ]; then
+            AUTOMATED_ARG="--automated"
+          fi
+          if ! python scripts/check_run_guard.py startup-window --event "$EVENT_NAME" --mode "$RUN_MODE" $AUTOMATED_ARG; then
+            CURRENT_TIME_ICT=$(TZ="Asia/Ho_Chi_Minh" date +%H:%M:%S)
+            SKIP_REASON="Automated run started outside startup window [15:30, 16:00) Asia/Ho_Chi_Minh (started at $CURRENT_TIME_ICT ICT on $CALCULATED_DATE)."
+            echo "::warning title=Startup Window Guard::$SKIP_REASON"
+            echo "skip_run=true" >> $GITHUB_OUTPUT
+            echo "skip_reason=$SKIP_REASON" >> $GITHUB_OUTPUT
+          else
+            echo "skip_run=false" >> $GITHUB_OUTPUT
+          fi
 
       - name: Restore Persistent State Ledger Cache
+        if: steps.run-scope.outputs.skip_run != 'true'
         uses: actions/cache/restore@v4
         id: state-cache
         with:
@@ -167,6 +194,7 @@ jobs:
             traffic-state-ledger-
 
       - name: Retrieve Latest State Checkpoint Artifact (Fallback or Supersede)
+        if: steps.run-scope.outputs.skip_run != 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           CURRENT_RUN_ID: ${{ github.run_id }}
@@ -293,8 +321,52 @@ jobs:
           shutil.rmtree(tmp_dir, ignore_errors=True)
           PYEOF
 
+      - name: Check for Duplicate Live Capture on Same Date
+        id: guard-duplicate
+        if: steps.run-scope.outputs.skip_run != 'true'
+        env:
+          DATE: ${{ steps.run-scope.outputs.date }}
+          MODE: ${{ steps.run-scope.outputs.mode }}
+          DRY_RUN: ${{ steps.run-scope.outputs.dry_run }}
+          STATE_FILE: ${{ steps.run-scope.outputs.state_file }}
+          REPO: ${{ github.repository }}
+          CURRENT_RUN_ID: ${{ github.run_id }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          CHECKPOINT_ARCHIVE="artifacts/checkpoints/state_checkpoint.tar.gz"
+          CHK_ARG=""
+          if [ -f "$CHECKPOINT_ARCHIVE" ]; then
+            CHK_ARG="--checkpoint-archive $CHECKPOINT_ARCHIVE"
+          fi
+          DB_ARG=""
+          if [ -f "$STATE_FILE" ]; then
+            DB_ARG="--db-path $STATE_FILE"
+          fi
+          DRY_RUN_ARG=""
+          if [ "$DRY_RUN" = "true" ]; then
+            DRY_RUN_ARG="--dry-run"
+          fi
+
+          if ! python scripts/check_run_guard.py check-duplicate \
+            --date "$DATE" \
+            --mode "$MODE" \
+            $DRY_RUN_ARG \
+            $CHK_ARG \
+            $DB_ARG \
+            --study-id "hcm_urban_13paths" \
+            --repo "$REPO" \
+            --current-run-id "$CURRENT_RUN_ID"; then
+            SKIP_REASON="Production live capture for $DATE already completed by prior run."
+            echo "::warning title=Duplicate Capture Guard::$SKIP_REASON"
+            echo "skip_run=true" >> $GITHUB_OUTPUT
+            echo "skip_reason=$SKIP_REASON" >> $GITHUB_OUTPUT
+          else
+            echo "skip_run=false" >> $GITHUB_OUTPUT
+          fi
+
       - name: Verify and Reconcile State Ledger
         id: verify-state
+        if: steps.run-scope.outputs.skip_run != 'true' && steps.guard-duplicate.outputs.skip_run != 'true'
         env:
           STATE_FILE: ${{ steps.run-scope.outputs.state_file }}
           ALLOW_INIT: ${{ steps.run-scope.outputs.allow_init }}
@@ -363,11 +435,13 @@ jobs:
           echo "state_verified=true" >> $GITHUB_OUTPUT
 
       - name: Run Doctor Diagnostic
+        if: steps.run-scope.outputs.skip_run != 'true' && steps.guard-duplicate.outputs.skip_run != 'true'
         run: |
           python main.py --config $STUDY_CONFIG doctor
 
       - name: Execute Capture Run (Trial or Afternoon)
         id: execute-step
+        if: steps.run-scope.outputs.skip_run != 'true' && steps.guard-duplicate.outputs.skip_run != 'true'
         env:
           DATE: ${{ steps.run-scope.outputs.date }}
           MODE: ${{ steps.run-scope.outputs.mode }}
@@ -481,6 +555,8 @@ jobs:
           MODE: ${{ steps.run-scope.outputs.mode }}
           DRY_RUN: ${{ steps.run-scope.outputs.dry_run }}
           TRIAL_ROOT: ${{ steps.execute-step.outputs.trial_root }}
+          SKIP_RUN: ${{ steps.run-scope.outputs.skip_run == 'true' || steps.guard-duplicate.outputs.skip_run == 'true' }}
+          SKIP_REASON: ${{ steps.run-scope.outputs.skip_reason || steps.guard-duplicate.outputs.skip_reason }}
         run: |
           python - << 'EOF'
           import csv, json, os, sys
@@ -494,10 +570,18 @@ jobs:
           mode = os.environ.get("MODE", "Unknown")
           dry_run = os.environ.get("DRY_RUN", "false")
           trial_root_env = os.environ.get("TRIAL_ROOT")
+          skip_run = os.environ.get("SKIP_RUN", "false").lower() == "true"
+          skip_reason = os.environ.get("SKIP_REASON", "Run halted early by guard policy.")
 
           lines = []
           lines.append("# HCM-Traffic 13-Path Run Summary")
           lines.append(f"**Execution Mode:** `{mode}` | **Target Date:** `{target_date}` | **Timezone:** `Asia/Ho_Chi_Minh` | **Dry Run:** `{dry_run}`\n")
+
+          if skip_run:
+              lines.append("> [!WARNING]")
+              lines.append("> ### Run Halted Early (Safety Guard Triggered)")
+              lines.append(f"> **Reason:** {skip_reason}")
+              lines.append("> **Safety Invariant:** Halted before modifying state ledger and before calling capture APIs. Quota preserved. Subsequent runs will not be blocked.\n")
 
           if trial_root_env and Path(trial_root_env).is_dir():
               pub_dirs = [Path(trial_root_env)]
@@ -531,9 +615,10 @@ jobs:
                       lines.append("\n| Segment ID | Road Name | Dir | Slot | Speed (km/h) | CI | Geom Cov |")
                       lines.append("| :--- | :--- | :---: | :---: | :---: | :---: | :---: |")
                       for r in day_rows[:13]:
-                          lines.append(f"| `{r.get('segment_id')}` | {r.get('road_name')} | {r.get('direction_id')} | {r.get('time_slot')} | {r.get('current_speed_kmh')} | {r.get('ci')} | {float(r.get('geometry_coverage', 0)):.4f} |")
+                          geom_cov = float(r.get('geometry_coverage') or 0)
+                          lines.append(f"| `{r.get('segment_id')}` | {r.get('road_name')} | {r.get('direction_id')} | {r.get('time_slot')} | {r.get('current_speed_kmh')} | {r.get('ci')} | {geom_cov:.4f} |")
 
-          if not found_data:
+          if not found_data and not skip_run:
               lines.append("> [!INFO]\n> No observations published. (Normal for dry-run or preflight aborts). Check step logs for diagnostic preflight results.")
 
           bundle_dir = Path("artifacts/run_bundles")
