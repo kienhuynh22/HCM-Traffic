@@ -1,6 +1,6 @@
 name: Capture 13 Paths
 run-name: >-
-  ${{ github.event_name == 'schedule' && 'Capture 13 Paths [afternoon_37slots live]' || format('Capture 13 Paths [{0} {1} {2}]', inputs.mode, inputs.dry_run && 'dry-run' || 'live', inputs.date || 'auto-vn') }}
+  ${{ github.event_name == 'schedule' && 'Capture 13 Paths [afternoon_37slots live]' || format('Capture 13 Paths [{0} {1} {2}]', inputs.mode, format('{0}', inputs.dry_run) == 'true' && 'dry-run' || 'live', inputs.date || 'auto-vn') }}
 
 on:
   workflow_dispatch:
@@ -328,6 +328,7 @@ jobs:
           DATE: ${{ steps.run-scope.outputs.date }}
           MODE: ${{ steps.run-scope.outputs.mode }}
           DRY_RUN: ${{ steps.run-scope.outputs.dry_run }}
+          STATE_FILE: ${{ steps.run-scope.outputs.state_file }}
           REPO: ${{ github.repository }}
           CURRENT_RUN_ID: ${{ github.run_id }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -336,6 +337,10 @@ jobs:
           CHK_ARG=""
           if [ -f "$CHECKPOINT_ARCHIVE" ]; then
             CHK_ARG="--checkpoint-archive $CHECKPOINT_ARCHIVE"
+          fi
+          DB_ARG=""
+          if [ -f "$STATE_FILE" ]; then
+            DB_ARG="--db-path $STATE_FILE"
           fi
           DRY_RUN_ARG=""
           if [ "$DRY_RUN" = "true" ]; then
@@ -347,6 +352,7 @@ jobs:
             --mode "$MODE" \
             $DRY_RUN_ARG \
             $CHK_ARG \
+            $DB_ARG \
             --study-id "hcm_urban_13paths" \
             --repo "$REPO" \
             --current-run-id "$CURRENT_RUN_ID"; then

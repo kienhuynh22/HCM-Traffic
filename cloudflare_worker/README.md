@@ -12,7 +12,7 @@ Independent cron monitor deployed on Cloudflare Workers to guarantee that the `a
    - At `15:45`, it checks again; if the `15:35` dispatch or GitHub cron (`15:40`) is already queued/running, it skips dispatch. If `15:35` failed or was skipped, `15:45` acts as a second safety net.
 2. **Duplicate & Partial-Capture Prevention Check:**
    - Queries GitHub Actions API for `capture_13paths.yml` workflow runs.
-   - **Active Run:** If a production live run for today is `queued`, `in_progress`, or `waiting`, it **skips dispatch**. Active `dry-run` or `trial_3slots` runs do not suppress production dispatch.
+   - **Active Run:** If a production live run for today is `queued`, `in_progress`, `waiting`, `pending`, or `requested` (including manual runs queued behind concurrency), it **skips dispatch**. Active `dry-run` or `trial_3slots` runs do not suppress production dispatch.
    - **Completed or Partial Capture (including `conclusion == 'failure'` like Run #20):** Inspects recent completed runs regardless of conclusion. If a run captured production slots for today (`afternoon_37slots` bundle >= 2 MB or capture step ran past 16:00 ICT for >= 120s), it **skips dispatch** so partial sessions (e.g., 36/37 slots) are never re-captured in full.
    - **Distinction:** Ignores `dry-run`, `trial_3slots`, early-halted runs, and 0-slot midnight timeout runs (e.g. Run #10, #21).
 3. **Dispatch (`POST /dispatches`):**
@@ -72,6 +72,7 @@ npx wrangler secret put GITHUB_TOKEN
 
 ```bash
 cd cloudflare_worker
+npm test
 npm install
 echo "GITHUB_TOKEN=your_pat_token_here" > .dev.vars
 npm run dev
@@ -80,7 +81,7 @@ npm run dev
 # GET http://localhost:8787/check
 ```
 
-Deploy when approved:
+Deploy **only after merging PR #5 into `master`** (so `capture_13paths.yml` on `master` accepts the `automated` input):
 ```bash
 npm run deploy
 ```

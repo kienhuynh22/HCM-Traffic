@@ -1,11 +1,13 @@
 {
   "name": "hcm-traffic-scheduler-guard",
   "version": "1.0.0",
-  "description": "Cloudflare Worker cron guard to dispatch HCM-Traffic 13-path capture at 15:45 VN if not already running",
+  "type": "module",
+  "description": "Cloudflare Worker cron guard to dispatch HCM-Traffic 13-path capture at 15:35 and 15:45 VN if not already running",
   "main": "src/index.js",
   "scripts": {
     "dev": "wrangler dev",
-    "deploy": "wrangler deploy"
+    "deploy": "wrangler deploy",
+    "test": "node --test test/worker.test.mjs"
   },
   "devDependencies": {
     "wrangler": "^3.88.0"

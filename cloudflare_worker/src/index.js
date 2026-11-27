@@ -33,8 +33,16 @@ export function getVietnamTimeStr(date = new Date()) {
   }).format(date);
 }
 
+export const ACTIVE_RUN_STATUSES = [
+  "queued",
+  "in_progress",
+  "waiting",
+  "pending",
+  "requested",
+];
+
 export function isActiveProductionLiveRun(run, todayVN) {
-  if (!["queued", "in_progress", "waiting"].includes(run.status)) {
+  if (!ACTIVE_RUN_STATUSES.includes(run.status)) {
     return false;
   }
   const title = String(run.display_title || "");
